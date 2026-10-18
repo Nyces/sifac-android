@@ -345,6 +345,28 @@ def cmd_chart(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mesh(args: argparse.Namespace) -> int:
+    from .bml import BmlError, find_bml_in_pac, render_silhouette
+
+    archive = find_bml_in_pac(args.pac, args.character)
+    meshes = archive.meshes()
+    print(f"{args.pac}: {len(meshes)} mesh(es), {sum(m.vertex_count for m in meshes)} vertices")
+    for mesh in meshes:
+        low, high = mesh.bounds()
+        print(
+            f"  {mesh.name:26s} v={mesh.vertex_count:6d} tri={mesh.triangle_count:6d} "
+            f"z=[{low[2]:.3f}, {high[2]:.3f}]"
+        )
+    print("textures:", ", ".join(archive.texture_names()[:8]))
+    if args.obj:
+        Path(args.obj).write_text(archive.to_obj(), encoding="utf-8")
+        print(f"wrote {args.obj}")
+    if args.png:
+        Path(args.png).write_bytes(render_silhouette(meshes))
+        print(f"wrote {args.png}")
+    return 0
+
+
 def cmd_hexdump(args: argparse.Namespace) -> int:
     data = Path(args.file).read_bytes()
     for line in hexdump(data, offset=args.offset, length=args.length):
@@ -436,6 +458,13 @@ def build_parser() -> argparse.ArgumentParser:
     chart.add_argument("--png")
     chart.add_argument("--limit", type=int, default=20)
     chart.set_defaults(func=cmd_chart)
+
+    mesh = sub.add_parser("mesh", help="extract a character mesh to OBJ and a PNG preview")
+    mesh.add_argument("pac")
+    mesh.add_argument("--character", default=None)
+    mesh.add_argument("--obj")
+    mesh.add_argument("--png")
+    mesh.set_defaults(func=cmd_mesh)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")

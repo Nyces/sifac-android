@@ -73,8 +73,8 @@ class BmarArchive:
         return None
 
 
-def find_bmar_in_pac(path: str | Path) -> BmarArchive:
-    """Find the first BMAR model inside a .pac that contains ``model.pac``."""
+def find_bmar_in_pac(path: str | Path, character: str | None = None) -> BmarArchive:
+    """Find the BMAR model inside a .pac that contains ``model.pac``."""
     image = read_pac(path)
     top = ArcArchive(image.data)
     model_entry = top.find("model.pac")
@@ -83,6 +83,8 @@ def find_bmar_in_pac(path: str | Path) -> BmarArchive:
     model_arc_bytes, _ = unwrap_section(top.entry_data(model_entry))
     model_arc = ArcArchive(model_arc_bytes)
     for entry in model_arc.entries:
+        if character and entry.name != character:
+            continue
         if entry.type in {"mdl", "mdls"} or entry.name.startswith("mod_"):
             bmar_bytes, _ = unwrap_section(model_arc.entry_data(entry))
             if bmar_bytes.startswith(BMAR_MAGIC):

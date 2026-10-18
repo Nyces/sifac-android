@@ -136,3 +136,56 @@ def build_scd(records: list[tuple[int, int, int, int, int, int]], channel: int =
     for index, record in enumerate(records):
         struct.pack_into("<6I", data, 0xE0 + index * 0x20, *record)
     return bytes(data)
+
+
+def _chunk(tag: str, payload: bytes) -> bytes:
+    body = bytearray(payload)
+    body += b"\0" * ((4 - len(body) % 4) % 4)
+    return tag.encode("ascii").ljust(4, b"\0") + struct.pack("<II", len(payload), 0x40000) + bytes(body)
+
+
+def build_bml_mesh(
+    name: str = "test_mesh",
+    positions: list[tuple[float, float, float]] | None = None,
+    uvs: list[tuple[float, float]] | None = None,
+) -> bytes:
+    """Build a minimal BML with one MESH chunk and its four DATA blocks."""
+    positions = positions or [(0.0, 0.0, 0.0), (1.0, 0.0, 1.0)]
+    uvs = uvs or [(0.0, 0.0), (1.0, 1.0)]
+    stride = 84
+    vertex_count = len(positions)
+    indices = [0, 1, 0] if vertex_count >= 2 else [0, 0, 0]
+
+    name_payload = name.encode("ascii") + b"\0"
+    vertex_payload = bytearray(vertex_count * stride)
+    for i, (position, uv) in enumerate(zip(positions, uvs)):
+        offset = i * stride
+        struct.pack_into("<7f", vertex_payload, offset, *position, 0.0, 0.0, 1.0, 0.0)
+        struct.pack_into("<2H", vertex_payload, offset + 0x38,
+                         int(uv[0] * 65535), int(uv[1] * 65535))
+    index_payload = struct.pack(f"<{len(indices)}H", *indices)
+    counts_payload = struct.pack("<4I", vertex_count, 0, len(indices), 0)
+
+    name_chunk = _chunk("DATA", name_payload)
+    vertex_chunk = _chunk("DATA", bytes(vertex_payload))
+    index_chunk = _chunk("DATA", index_payload)
+    counts_chunk = _chunk("DATA", counts_payload)
+
+    header = _chunk("BML", b"\0" * 16)
+    cursor = len(header) + 12 + 0x68
+    name_ptr = cursor + 12
+    cursor += len(name_chunk)
+    vertex_ptr = cursor + 12
+    cursor += len(vertex_chunk)
+    index_ptr = cursor + 12
+    cursor += len(index_chunk)
+    counts_ptr = cursor + 12
+
+    payload = bytearray(0x68)
+    struct.pack_into("<4Q", payload, 0x00, name_ptr, vertex_ptr, index_ptr, counts_ptr)
+    struct.pack_into("<I", payload, 0x50, len(indices))
+    struct.pack_into("<I", payload, 0x54, vertex_count)
+    struct.pack_into("<HH", payload, 0x58, 2, stride)
+    mesh_chunk = _chunk("MESH", bytes(payload))
+
+    return header + mesh_chunk + name_chunk + vertex_chunk + index_chunk + counts_chunk
