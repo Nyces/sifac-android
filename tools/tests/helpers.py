@@ -116,3 +116,23 @@ def build_btx(name: str, width: int, height: int, fmt: int, payload: bytes) -> b
     encoded = name.encode("ascii") + b"\0"
     header[0x30 : 0x30 + len(encoded)] = encoded
     return bytes(header) + payload
+
+
+def build_scd(records: list[tuple[int, int, int, int, int, int]], channel: int = 1) -> bytes:
+    """Build a synthetic score file.
+
+    records: [(id, tick, lane_raw, constant, value, channel)]
+    """
+    size = 0xE0 + len(records) * 0x20 + 0x20
+    data = bytearray(size)
+    struct.pack_into("<I", data, 0x00, size)
+    struct.pack_into("<I", data, 0x04, 0x80)
+    data[0x80:0x84] = b"Scor"
+    struct.pack_into("<I", data, 0x84, size)
+    struct.pack_into("<I", data, 0x88, len(records) + 1)
+    struct.pack_into("<I", data, 0x8C, 0x45C12)
+    struct.pack_into("<I", data, 0x90, 480)
+    struct.pack_into("<I", data, 0x9C, channel)
+    for index, record in enumerate(records):
+        struct.pack_into("<6I", data, 0xE0 + index * 0x20, *record)
+    return bytes(data)

@@ -314,6 +314,37 @@ def cmd_tex(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chart(args: argparse.Namespace) -> int:
+    from .chart import render_chart
+
+    pack = LivePack(args.pac)
+    if args.list:
+        for chart in pack.charts(args.channel):
+            print(
+                f"{chart.difficulty_name:12s} {chart.name:46s} "
+                f"notes={len(chart.notes):4d} last_tick={max((n.tick for n in chart.notes), default=0)}"
+            )
+        return 0
+    chart = pack.chart(args.difficulty, args.channel)
+    print(
+        f"{chart.name}: {len(chart.notes)} notes, difficulty={chart.difficulty_name}, "
+        f"ticks_per_beat={chart.header.ticks_per_beat}"
+    )
+    if args.csv:
+        Path(args.csv).write_text(chart.to_csv(), encoding="utf-8")
+        print(f"wrote {args.csv}")
+    if args.png:
+        Path(args.png).write_bytes(render_chart(chart))
+        print(f"wrote {args.png}")
+    if not args.csv and not args.png:
+        for note in chart.notes[: args.limit]:
+            print(
+                f"  id={note.id:4d} tick={note.tick:7d} beat={note.beat:8.2f} "
+                f"lane={note.lane} value={note.value}"
+            )
+    return 0
+
+
 def cmd_hexdump(args: argparse.Namespace) -> int:
     data = Path(args.file).read_bytes()
     for line in hexdump(data, offset=args.offset, length=args.length):
@@ -395,6 +426,16 @@ def build_parser() -> argparse.ArgumentParser:
     tex.add_argument("--depth", type=int, default=3)
     tex.add_argument("--json", action="store_true")
     tex.set_defaults(func=cmd_tex)
+
+    chart = sub.add_parser("chart", help="parse a live chart and export CSV/PNG")
+    chart.add_argument("pac")
+    chart.add_argument("--list", action="store_true")
+    chart.add_argument("--difficulty", default="04")
+    chart.add_argument("--channel", default="1")
+    chart.add_argument("--csv")
+    chart.add_argument("--png")
+    chart.add_argument("--limit", type=int, default=20)
+    chart.set_defaults(func=cmd_chart)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")
