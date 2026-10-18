@@ -14,6 +14,7 @@ from .bmar import BmarArchive, BmarError, find_bmar_in_pac, scan_magics
 from .pac import PacError, read_header, read_pac, scan_dump, verify_dump
 from .score import LivePack, ScoreError, iter_live_packs
 from .sfo import SfoError, read_sfo
+from .texture import BtxError, BtxTexture, find_textures
 
 
 def _print_json(value: object) -> None:
@@ -253,6 +254,66 @@ def cmd_score(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tex(args: argparse.Namespace) -> int:
+    image = read_pac(args.pac)
+    out_dir = Path(args.outdir) if args.outdir else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    stats: dict[str, int] = {}
+    exported = 0
+    failures: list[str] = []
+
+    def walk(data: bytes, depth: int, trail: str) -> None:
+        nonlocal exported
+        try:
+            arc = ArcArchive(data)
+        except ArcError:
+            return
+        for entry in arc.entries:
+            payload, _ = unwrap_section(arc.entry_data(entry))
+            label = f"{trail}/{entry.name}" if trail else entry.name
+            hits = find_textures(payload, limit=0x100)
+            if hits and payload.startswith(b"btx\0"):
+                try:
+                    texture = BtxTexture(payload)
+                except BtxError as exc:
+                    failures.append(f"{label}: {exc}")
+                    continue
+                name = texture.header.format_name
+                stats[name] = stats.get(name, 0) + 1
+                if out_dir and args.export:
+                    if args.filter and args.filter.lower() not in texture.header.name.lower():
+                        continue
+                    try:
+                        png = texture.to_png()
+                    except BtxError as exc:
+                        failures.append(f"{label}: {exc}")
+                        continue
+                    except ImportError:
+                        failures.append(f"{label}: texture2ddecoder is required for BC7")
+                        continue
+                    target = out_dir / f"{_safe_name(texture.header.name or entry.name)}.png"
+                    target.write_bytes(png)
+                    exported += 1
+            elif payload.startswith(b"ARC\0") and depth < args.depth:
+                walk(payload, depth + 1, label)
+
+    walk(image.data, 0, "")
+    total = sum(stats.values())
+    if args.json:
+        _print_json({"textures": total, "formats": stats, "exported": exported,
+                     "failures": failures[:50]})
+    else:
+        print(f"{args.pac}: {total} texture(s)")
+        for name, count in sorted(stats.items()):
+            print(f"  {name:12s} {count}")
+        if out_dir and args.export:
+            print(f"exported {exported} PNG file(s) to {out_dir}")
+        for failure in failures[:20]:
+            print(f"  skipped: {failure}")
+    return 0
+
+
 def cmd_hexdump(args: argparse.Namespace) -> int:
     data = Path(args.file).read_bytes()
     for line in hexdump(data, offset=args.offset, length=args.length):
@@ -325,6 +386,15 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--extract")
     score.add_argument("--unwrap", action="store_true")
     score.set_defaults(func=cmd_score)
+
+    tex = sub.add_parser("tex", help="list or export btx textures inside a .pac")
+    tex.add_argument("pac")
+    tex.add_argument("outdir", nargs="?")
+    tex.add_argument("--export", action="store_true")
+    tex.add_argument("--filter", default="")
+    tex.add_argument("--depth", type=int, default=3)
+    tex.add_argument("--json", action="store_true")
+    tex.set_defaults(func=cmd_tex)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")

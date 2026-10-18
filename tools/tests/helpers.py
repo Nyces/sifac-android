@@ -102,3 +102,17 @@ def build_awb(entries: list[tuple[int, bytes]], magic: bytes = b"HCA\0") -> byte
         struct.pack_into("<I", result, 0x10 + count * 2 + index * 4, offsets[index])
     result[data_start:] = payloads
     return bytes(result)
+
+
+def build_btx(name: str, width: int, height: int, fmt: int, payload: bytes) -> bytes:
+    """Build a synthetic btx texture with a 0x80-byte header."""
+    header = bytearray(0x80)
+    header[0:4] = b"btx\0"
+    struct.pack_into("<H", header, 4, 0x0102)
+    struct.pack_into("<HH", header, 8, width, height)
+    struct.pack_into("<I", header, 0x0C, width * 4)
+    struct.pack_into("<I", header, 0x10, 0x01000000 | fmt)
+    struct.pack_into("<I", header, 0x24, 0x30)
+    encoded = name.encode("ascii") + b"\0"
+    header[0x30 : 0x30 + len(encoded)] = encoded
+    return bytes(header) + payload

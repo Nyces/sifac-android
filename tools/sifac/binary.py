@@ -16,6 +16,7 @@ KNOWN_MAGICS: tuple[bytes, ...] = (
     b"BMT\0",
     b"MTXP",
     b"MDL\0",
+    b"btx\0",
     b"ANHD",
     b"ANSK",
     b"POF0",
