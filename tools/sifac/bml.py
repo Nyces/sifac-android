@@ -30,15 +30,20 @@ matter here:
 ``MATE``   material; first two pointers are the material name and its texture
 ``DRAW``   draw call: u32 node index, mesh index, material index, flags
 
-Vertex layout for stride 84 (confirmed on ``mod_01_honoka``)::
+Vertex layout (empirically validated per stride; attribute offsets differ because
+meshes without skinning omit the tail block)::
 
-    0x00  3 x f32 position
-    0x0c  3 x f32 normal
-    0x18  f32      (tangent w / unused)
-    0x1c  4 bytes  constant
-    0x20  12 bytes zeros
-    0x38  2 x u16  UV (unorm16)
-    0x34  4 bytes  constant (0x40,0x30,0x1f,0xff)
+    stride 84   0x00 3 x f32 position
+                0x0c 3 x f32 normal
+                0x1c 4 x u8  bone indices (undecompressed weights)
+                0x40 2 x u16 UV (unorm16), followed by extra UV sets
+
+    stride 60   0x00 3 x f32 position
+                0x0c 3 x f32 normal
+                0x18 2 x u16 UV (unorm16)
+
+Skin weights are not decoded yet: the tail of the stride-84 vertex does not
+contain a u8 weight quad that sums to 255, so the weight source is still open.
 """
 
 from __future__ import annotations
@@ -59,6 +64,9 @@ MESH_HEADER_FIELDS = {
     "counts": 0x18,
 }
 TOPOLOGY_TRIANGLES = 2
+# Offset of the first UV set, keyed by vertex stride. Meshes with skinning use
+# a longer vertex and keep UVs further in.
+UV_OFFSET_BY_STRIDE = {60: 0x18, 84: 0x40}
 
 
 class BmlError(ValueError):
@@ -285,10 +293,11 @@ class BmlArchive:
         )
         for i in range(vertex_count):
             offset = vertex_ptr + i * stride
-            x, y, z, nx, ny, nz, _w = struct.unpack_from("<7f", self.data, offset)
+            x, y, z, nx, ny, nz = struct.unpack_from("<6f", self.data, offset)
             mesh.positions.append((x, y, z))
             mesh.normals.append((nx, ny, nz))
-            u_raw, v_raw = struct.unpack_from("<2H", self.data, offset + 0x38)
+            uv_offset = UV_OFFSET_BY_STRIDE.get(stride, 0x40 if stride >= 0x44 else 0x18)
+            u_raw, v_raw = struct.unpack_from("<2H", self.data, offset + uv_offset)
             mesh.uvs.append((u_raw / 65535.0, v_raw / 65535.0))
         mesh.indices = list(
             struct.unpack_from(f"<{index_count}H", self.data, index_ptr)

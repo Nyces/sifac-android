@@ -160,8 +160,8 @@ def build_bml_mesh(
     vertex_payload = bytearray(vertex_count * stride)
     for i, (position, uv) in enumerate(zip(positions, uvs)):
         offset = i * stride
-        struct.pack_into("<7f", vertex_payload, offset, *position, 0.0, 0.0, 1.0, 0.0)
-        struct.pack_into("<2H", vertex_payload, offset + 0x38,
+        struct.pack_into("<6f", vertex_payload, offset, *position, 0.0, 0.0, 1.0)
+        struct.pack_into("<2H", vertex_payload, offset + 0x40,
                          int(uv[0] * 65535), int(uv[1] * 65535))
     index_payload = struct.pack(f"<{len(indices)}H", *indices)
     counts_payload = struct.pack("<4I", vertex_count, 0, len(indices), 0)
