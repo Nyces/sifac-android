@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sifac-tools"
+version = "0.1.0"
+description = "Read-only verification tools for a user-owned SIFAC (CUSA24620) dump"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+sifac-tools = "sifac.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["tools"]
+include = ["sifac*"]

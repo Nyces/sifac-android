@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build output
+build/
+dist/
+out/
+*.apk
+*.aab
+
+# SIFAC game dump / copyrighted assets must never be committed
+CUSA24620/
+*.pac
+*.awb
+*.acb
+*.acf
+*.usm
+*.elf
+*.prx
+*.sfo
+*.dds
+*.hca
+*.adx
