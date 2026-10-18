@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import struct
 import unittest
 
 from sifac.bml import BmlArchive, BmlError, render_silhouette
 
-from tests.helpers import build_bml_mesh
+from tests.helpers import _chunk, build_bml_mesh
 
 
 class BmlTests(unittest.TestCase):
@@ -46,6 +47,29 @@ class BmlTests(unittest.TestCase):
         meshes = BmlArchive(raw).meshes()
         png = render_silhouette(meshes)
         self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_nodes_materials_draws(self) -> None:
+        node = bytearray(0x68)
+        struct.pack_into("<3f", node, 0x10, 1.0, 2.0, 3.0)
+        struct.pack_into("<3f", node, 0x1C, 1.0, 1.0, 1.0)
+        struct.pack_into("<3f", node, 0x28, 0.1, 0.2, 0.3)
+        draw = struct.pack("<4I", 0, 0, 1, 0)
+        raw = build_bml_mesh() + _chunk("NODE", bytes(node)) + _chunk("MATE", bytes(0x48)) + _chunk("DRAW", draw)
+        archive = BmlArchive(raw)
+        nodes = archive.nodes()
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].translation, (1.0, 2.0, 3.0))
+        self.assertAlmostEqual(nodes[0].rotation[2], 0.3, places=5)
+        self.assertEqual(len(archive.materials()), 1)
+        calls = archive.draw_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0].node_index, calls[0].mesh_index, calls[0].material_index), (0, 0, 1))
+        self.assertIsNone(archive.node_world_position("missing"))
+
+    def test_mtl_export(self) -> None:
+        raw = build_bml_mesh() + _chunk("MATE", bytes(0x48))
+        mtl = BmlArchive(raw).to_mtl()
+        self.assertIn("newmtl", mtl)
 
     def test_bad_magic(self) -> None:
         with self.assertRaises(BmlError):

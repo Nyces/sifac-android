@@ -17,8 +17,18 @@ matter here:
 
 ``DATA``   raw payload (names, vertices, indices, counts)
 ``TXTR``   texture reference used by the model
-``MATE``   material (name + shader parameters)
-``DRAW``   draw call binding
+``NODE``   scene-graph node; payload:
+
+             +0x00 u64 name string offset
+             +0x08 u64 parent name string offset
+             +0x10 3 x f32 translation
+             +0x1c 3 x f32 scale
+             +0x28 3 x f32 rotation (Euler radians, applied Z * Y * X)
+             +0x34 3 x f32 bounding box min
+             +0x40 3 x f32 bounding box max
+
+``MATE``   material; first two pointers are the material name and its texture
+``DRAW``   draw call: u32 node index, mesh index, material index, flags
 
 Vertex layout for stride 84 (confirmed on ``mod_01_honoka``)::
 
@@ -33,6 +43,7 @@ Vertex layout for stride 84 (confirmed on ``mod_01_honoka``)::
 
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,6 +75,33 @@ class Chunk:
     @property
     def payload_offset(self) -> int:
         return self.offset + CHUNK_HEADER
+
+
+@dataclass(frozen=True)
+class Node:
+    index: int
+    name: str
+    parent: str
+    translation: tuple[float, float, float]
+    scale: tuple[float, float, float]
+    rotation: tuple[float, float, float]
+    bbox_min: tuple[float, float, float]
+    bbox_max: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class Material:
+    index: int
+    name: str
+    texture: str
+
+
+@dataclass(frozen=True)
+class DrawCall:
+    node_index: int
+    mesh_index: int
+    material_index: int
+    flags: int
 
 
 @dataclass
@@ -140,6 +178,85 @@ class BmlArchive:
                 meshes.append(mesh)
         return meshes
 
+    def nodes(self) -> list[Node]:
+        nodes: list[Node] = []
+        for index, chunk in enumerate(self.find("NODE")):
+            payload = chunk.payload_offset
+            name_ptr, parent_ptr = struct.unpack_from("<2Q", self.data, payload)
+            translation = struct.unpack_from("<3f", self.data, payload + 0x10)
+            scale = struct.unpack_from("<3f", self.data, payload + 0x1C)
+            rotation = struct.unpack_from("<3f", self.data, payload + 0x28)
+            bbox_min = struct.unpack_from("<3f", self.data, payload + 0x34)
+            bbox_max = struct.unpack_from("<3f", self.data, payload + 0x40)
+            nodes.append(
+                Node(
+                    index=index,
+                    name=self.string_at(name_ptr) if name_ptr else "",
+                    parent=self.string_at(parent_ptr) if parent_ptr else "",
+                    translation=translation,
+                    scale=scale,
+                    rotation=rotation,
+                    bbox_min=bbox_min,
+                    bbox_max=bbox_max,
+                )
+            )
+        return nodes
+
+    def materials(self) -> list[Material]:
+        materials: list[Material] = []
+        for index, chunk in enumerate(self.find("MATE")):
+            payload = chunk.payload_offset
+            name_ptr, texture_ptr = struct.unpack_from("<2Q", self.data, payload)
+            materials.append(
+                Material(
+                    index=index,
+                    name=self.string_at(name_ptr) if name_ptr else "",
+                    texture=self.string_at(texture_ptr) if texture_ptr else "",
+                )
+            )
+        return materials
+
+    def draw_calls(self) -> list[DrawCall]:
+        calls: list[DrawCall] = []
+        for chunk in self.find("DRAW"):
+            payload = chunk.payload_offset
+            node_index, mesh_index, material_index, flags = struct.unpack_from(
+                "<4I", self.data, payload
+            )
+            calls.append(DrawCall(node_index, mesh_index, material_index, flags))
+        return calls
+
+    def mesh_materials(self) -> dict[int, Material]:
+        """Map mesh index to its material via the DRAW table."""
+        materials = self.materials()
+        result: dict[int, Material] = {}
+        for call in self.draw_calls():
+            if 0 <= call.material_index < len(materials):
+                result[call.mesh_index] = materials[call.material_index]
+        return result
+
+    def node_world_position(self, name: str) -> tuple[float, float, float] | None:
+        """World position of a node in mesh space (Z up).
+
+        Local transforms are ``T * Rz * Ry * Rx * S`` (validated by the mirrored
+        eye positions and the head height on ``mod_01_honoka``). Node space is
+        Y up, while mesh vertices are Z up, so the result is converted with
+        ``(x, y, z) -> (x, -z, y)``.
+        """
+        nodes = {node.name: node for node in self.nodes()}
+        chain: list[Node] = []
+        current = nodes.get(name)
+        while current is not None:
+            chain.append(current)
+            current = nodes.get(current.parent)
+        if not chain:
+            return None
+        matrix = _identity()
+        for node in reversed(chain):
+            matrix = _mat_mul(matrix, _local_matrix(node))
+        x, y, z = matrix[0][3], matrix[1][3], matrix[2][3]
+        return (x, -z, y)
+
     def _read_mesh(self, chunk: Chunk) -> Mesh | None:
         payload = chunk.payload_offset
         if payload + 0x60 > len(self.data):
@@ -180,9 +297,13 @@ class BmlArchive:
 
     def to_obj(self, with_uv: bool = True) -> str:
         lines = ["# SIFAC Blade model (read-only extraction)"]
+        materials = self.mesh_materials()
         base = 1
-        for mesh in self.meshes():
+        for mesh_index, mesh in enumerate(self.meshes()):
             lines.append(f"o {mesh.name or 'mesh'}")
+            material = materials.get(mesh_index)
+            if material:
+                lines.append(f"usemtl {material.name}")
             # Blade uses Z as the up axis; OBJ expects Y up.
             for x, y, z in mesh.positions:
                 lines.append(f"v {x:.6f} {z:.6f} {-y:.6f}")
@@ -203,12 +324,60 @@ class BmlArchive:
             base += mesh.vertex_count
         return "\n".join(lines) + "\n"
 
+    def to_mtl(self) -> str:
+        lines = ["# SIFAC Blade materials (texture names refer to btx exports)"]
+        for material in self.materials():
+            lines.append(f"newmtl {material.name}")
+            lines.append("Kd 1.000000 1.000000 1.000000")
+            if material.texture:
+                lines.append(f"# btx texture: {material.texture}")
+                lines.append(f"map_Kd {material.texture}.png")
+            lines.append("")
+        return "\n".join(lines)
+
 
 def _set(pixels: bytearray, width: int, x: int, y: int, color: tuple[int, int, int, int]) -> None:
     height = len(pixels) // (width * 4)
     if 0 <= x < width and 0 <= y < height:
         offset = (y * width + x) * 4
         pixels[offset : offset + 4] = bytes(color)
+
+
+def _identity() -> list[list[float]]:
+    return [[1.0 if i == j else 0.0 for j in range(4)] for i in range(4)]
+
+
+def _mat_mul(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+    return [
+        [sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)]
+        for i in range(4)
+    ]
+
+
+def _rot_x(angle: float) -> list[list[float]]:
+    c, s = math.cos(angle), math.sin(angle)
+    return [[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]]
+
+
+def _rot_y(angle: float) -> list[list[float]]:
+    c, s = math.cos(angle), math.sin(angle)
+    return [[c, 0, s, 0], [0, 1, 0, 0], [-s, 0, c, 0], [0, 0, 0, 1]]
+
+
+def _rot_z(angle: float) -> list[list[float]]:
+    c, s = math.cos(angle), math.sin(angle)
+    return [[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+
+
+def _local_matrix(node: Node) -> list[list[float]]:
+    matrix = _identity()
+    matrix[0][3], matrix[1][3], matrix[2][3] = node.translation
+    rx, ry, rz = node.rotation
+    rotation = _mat_mul(_mat_mul(_rot_z(rz), _rot_y(ry)), _rot_x(rx))
+    matrix = _mat_mul(matrix, rotation)
+    scaling = _identity()
+    scaling[0][0], scaling[1][1], scaling[2][2] = node.scale
+    return _mat_mul(matrix, scaling)
 
 
 def render_silhouette(meshes: list[Mesh], width: int = 512, height: int = 768) -> bytes:

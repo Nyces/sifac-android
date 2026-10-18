@@ -350,17 +350,25 @@ def cmd_mesh(args: argparse.Namespace) -> int:
 
     archive = find_bml_in_pac(args.pac, args.character)
     meshes = archive.meshes()
+    materials = archive.materials()
+    draw_calls = archive.draw_calls()
     print(f"{args.pac}: {len(meshes)} mesh(es), {sum(m.vertex_count for m in meshes)} vertices")
-    for mesh in meshes:
+    bindings = archive.mesh_materials()
+    for index, mesh in enumerate(meshes):
         low, high = mesh.bounds()
+        material = bindings.get(index)
         print(
             f"  {mesh.name:26s} v={mesh.vertex_count:6d} tri={mesh.triangle_count:6d} "
             f"z=[{low[2]:.3f}, {high[2]:.3f}]"
+            + (f" mat={material.name}({material.texture})" if material else "")
         )
-    print("textures:", ", ".join(archive.texture_names()[:8]))
+    print(f"nodes={len(archive.nodes())} materials={len(materials)} draws={len(draw_calls)}")
     if args.obj:
         Path(args.obj).write_text(archive.to_obj(), encoding="utf-8")
         print(f"wrote {args.obj}")
+    if args.mtl:
+        Path(args.mtl).write_text(archive.to_mtl(), encoding="utf-8")
+        print(f"wrote {args.mtl}")
     if args.png:
         Path(args.png).write_bytes(render_silhouette(meshes))
         print(f"wrote {args.png}")
@@ -463,6 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
     mesh.add_argument("pac")
     mesh.add_argument("--character", default=None)
     mesh.add_argument("--obj")
+    mesh.add_argument("--mtl")
     mesh.add_argument("--png")
     mesh.set_defaults(func=cmd_mesh)
 
