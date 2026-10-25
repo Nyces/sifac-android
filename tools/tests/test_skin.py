@@ -12,6 +12,7 @@ from sifac.skin import (
     invert,
     mat_mul,
     palette_map,
+    place_by_nodes,
     transform_point,
     weights_from_palette,
 )
@@ -212,6 +213,46 @@ class AnchorTests(unittest.TestCase):
         face = self.mesh(60, [(0.0, 0.0, 0.0)])
         placed = anchor_rigid([face], {}, self.nodes, self.skeleton)
         self.assertIs(placed[0], face)
+
+
+class PlaceByNodesTests(unittest.TestCase):
+    def test_local_matrix_moves_mesh_once(self) -> None:
+        skeleton = Skeleton(
+            [
+                node(0, "root", "", (0.0, 0.0, 0.0), (0.0, 0.0, math.pi / 2)),
+                node(1, "prop", "root", (2.0, 0.0, 0.0)),
+            ]
+        )
+        nodes = list(skeleton.nodes.values())
+        mesh = Mesh(
+            name="box",
+            vertex_count=1,
+            index_count=0,
+            stride=48,
+            positions=[(1.0, 0.0, 0.0)],
+            normals=[(0.0, 0.0, 1.0)],
+            uvs=[(0.0, 0.0)],
+            indices=[],
+        )
+        placed = place_by_nodes([mesh], {0: 1}, nodes, skeleton)
+        # Only the prop's own translation applies, not the root rotation.
+        self.assertAlmostEqual(placed[0].positions[0][0], 3.0, places=5)
+        self.assertAlmostEqual(placed[0].positions[0][1], 0.0, places=5)
+
+    def test_unmapped_mesh_is_untouched(self) -> None:
+        skeleton = Skeleton([node(0, "root", "", (0.0, 0.0, 0.0))])
+        mesh = Mesh(
+            name="box",
+            vertex_count=1,
+            index_count=0,
+            stride=48,
+            positions=[(1.0, 2.0, 3.0)],
+            normals=[(0.0, 0.0, 1.0)],
+            uvs=[(0.0, 0.0)],
+            indices=[],
+        )
+        placed = place_by_nodes([mesh], {}, list(skeleton.nodes.values()), skeleton)
+        self.assertIs(placed[0], mesh)
 
 
 if __name__ == "__main__":

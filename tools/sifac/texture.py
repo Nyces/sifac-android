@@ -219,10 +219,13 @@ def find_textures(data: bytes, limit: int = 0x400) -> list[int]:
 
 
 def load_texture_archive(pac_path: str | Path) -> dict[str, "BtxTexture"]:
-    """Load the model's ``texture`` ARC keyed by btx name.
+    """Load every btx texture a model uses, keyed by both btx and ARC name.
 
-    A character ``.pac`` stores ``model.pac`` which contains the model entry and
-    a ``texture`` entry; the latter is another ARC whose payloads are btx files.
+    Two layouts exist:
+
+    * characters — ``model.pac`` holds the BMAR and a ``texture`` ARC;
+    * stages — ``model.pac`` holds only the BMAR and the textures live in a
+      sibling top-level ``texture.pac``.
     """
     from .arc import ArcArchive, ArcError
     from .binary import unwrap_section
@@ -230,19 +233,27 @@ def load_texture_archive(pac_path: str | Path) -> dict[str, "BtxTexture"]:
 
     image = read_pac(pac_path)
     top = ArcArchive(image.data)
-    model_entry = top.find("model.pac")
-    if model_entry is None:
-        return {}
-    model_bytes, _ = unwrap_section(top.entry_data(model_entry))
-    model_arc = ArcArchive(model_bytes)
-    texture_entry = model_arc.find("texture")
-    if texture_entry is None:
-        texture_entry = next(
+    texture_bytes: bytes | None = None
+
+    sibling = top.find("texture.pac") or next(
+        (entry for entry in top.entries if entry.type == "texs"), None
+    )
+    if sibling is not None:
+        texture_bytes = unwrap_section(top.entry_data(sibling))[0]
+
+    if texture_bytes is None:
+        model_entry = top.find("model.pac")
+        if model_entry is None:
+            return {}
+        model_bytes, _ = unwrap_section(top.entry_data(model_entry))
+        model_arc = ArcArchive(model_bytes)
+        nested = model_arc.find("texture") or next(
             (entry for entry in model_arc.entries if entry.type == "texs"), None
         )
-    if texture_entry is None:
-        return {}
-    texture_bytes, _ = unwrap_section(model_arc.entry_data(texture_entry))
+        if nested is None:
+            return {}
+        texture_bytes = unwrap_section(model_arc.entry_data(nested))[0]
+
     try:
         texture_arc = ArcArchive(texture_bytes)
     except ArcError:

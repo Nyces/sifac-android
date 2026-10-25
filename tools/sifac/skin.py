@@ -324,6 +324,36 @@ def weights_from_palette(
     return result
 
 
+def place_by_nodes(
+    meshes: list[Mesh],
+    draw_nodes: dict[int, int],
+    nodes: list[Node],
+    skeleton: "Skeleton",
+) -> list[Mesh]:
+    """Apply each mesh's DRAW node transform (used by static stage models).
+
+    Stage meshes are authored in stage space, so only the node's *local* matrix
+    applies — walking the parent chain would rotate the whole stage (the root
+    node carries the axis convention that the meshes already bake in). A
+    ``LaserBox`` mesh is 25 cm wide and only lands on the truss once its node
+    translation is applied.
+    """
+    placed: list[Mesh] = []
+    for index, mesh in enumerate(meshes):
+        node_index = draw_nodes.get(index)
+        if node_index is None or node_index >= len(nodes):
+            placed.append(mesh)
+            continue
+        matrix = skeleton.local(nodes[node_index].name)
+        placed.append(
+            replace(
+                mesh,
+                positions=[transform_point(matrix, p) for p in mesh.positions],
+            )
+        )
+    return placed
+
+
 def anchor_rigid(
     meshes: list[Mesh],
     draw_nodes: dict[int, int],

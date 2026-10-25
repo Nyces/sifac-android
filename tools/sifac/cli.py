@@ -437,6 +437,11 @@ def _pose_meshes(
             posed.append(mesh)
             skipped += 1
             continue
+        if not candidates:
+            # Stage and prop models have no Biped rig; leave the geometry as is.
+            posed.append(mesh)
+            skipped += 1
+            continue
         weights = (
             weights_from_palette(mesh, skeleton, mapping, candidates)
             if mesh.bone_indices and mapping
@@ -662,6 +667,62 @@ def cmd_render(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stage(args: argparse.Namespace) -> int:
+    from .bml import find_bml_in_pac
+    from .render import Camera, render_camera
+    from .skin import Skeleton, place_by_nodes
+    from .texture import load_texture_archive
+
+    archive = find_bml_in_pac(args.pac, args.model)
+    skeleton = Skeleton(archive.nodes())
+    nodes = archive.nodes()
+    draw_nodes = {call.mesh_index: call.node_index for call in archive.draw_calls()}
+    all_meshes = place_by_nodes(archive.meshes(), draw_nodes, nodes, skeleton)
+    bindings = archive.mesh_materials()
+    keep = [
+        index
+        for index, mesh in enumerate(all_meshes)
+        if not any(token.lower() in mesh.name.lower() for token in args.skip)
+    ]
+    meshes = [all_meshes[index] for index in keep]
+    sub_bindings = {new: bindings[old] for new, old in enumerate(keep) if old in bindings}
+    visible = [m for m in meshes if m.indices]
+    lo = [min(m.bounds()[0][k] for m in visible) for k in range(3)]
+    hi = [max(m.bounds()[1][k] for m in visible) for k in range(3)]
+    center = [(lo[k] + hi[k]) * 0.5 for k in range(3)]
+    radius = max(hi[k] - lo[k] for k in range(3)) * 0.5
+    textures = load_texture_archive(args.pac)
+    print(
+        f"{args.pac}: {len(meshes)} mesh(es), {sum(m.triangle_count for m in meshes)} triangles, "
+        f"{len(archive.materials())} materials, {len(textures)} textures"
+    )
+    print(
+        f"  bounds x=[{lo[0]:.2f},{hi[0]:.2f}] y=[{lo[1]:.2f},{hi[1]:.2f}] z=[{lo[2]:.2f},{hi[2]:.2f}]"
+    )
+    if args.skip:
+        print(f"  skipped names containing {args.skip}")
+    if args.bounds_only:
+        return 0
+    eye = tuple(args.eye) if args.eye else (
+        center[0],
+        center[1] - radius * 1.6,
+        center[2] + radius * 0.35,
+    )
+    target = tuple(args.target) if args.target else tuple(center)
+    camera = Camera(position=eye, target=target, fov_degrees=args.fov)
+    png = render_camera(
+        meshes,
+        sub_bindings,
+        textures,
+        camera,
+        width=args.width,
+        height=args.height,
+    )
+    Path(args.out).write_bytes(png)
+    print(f"wrote {args.out} (eye={tuple(round(v, 2) for v in eye)})")
+    return 0
+
+
 def cmd_hexdump(args: argparse.Namespace) -> int:
     data = Path(args.file).read_bytes()
     for line in hexdump(data, offset=args.offset, length=args.length):
@@ -810,6 +871,19 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--height", type=int, default=768)
     render.add_argument("--out", required=True)
     render.set_defaults(func=cmd_render)
+
+    stage = sub.add_parser("stage", help="render a stage model from a perspective camera")
+    stage.add_argument("pac")
+    stage.add_argument("--model", default=None)
+    stage.add_argument("--eye", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"))
+    stage.add_argument("--target", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"))
+    stage.add_argument("--skip", action="append", default=[], metavar="NAME")
+    stage.add_argument("--fov", type=float, default=45.0)
+    stage.add_argument("--width", type=int, default=640)
+    stage.add_argument("--height", type=int, default=360)
+    stage.add_argument("--out", required=True)
+    stage.add_argument("--bounds-only", action="store_true")
+    stage.set_defaults(func=cmd_stage)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")

@@ -47,6 +47,11 @@ meshes without skinning omit the tail block)::
                 0x0c 3 x f16 normal (RenderDoc event 608, eye pass)
                 0x18 2 x f16 UV
 
+    stride 48   0x00 3 x f32 position
+                0x0c 3 x f16 normal   (stage meshes)
+                0x14 u32 0xffffffff
+                0x18 2 x f16 UV
+
 Vertex attributes as actually bound on the PS4 GPU (confirmed with a RenderDoc
 capture of the retail game, draw of ``Honoka_hair``)::
 
@@ -325,6 +330,11 @@ class BmlArchive:
                 mesh.bone_indices.append(
                     struct.unpack_from("<4B", self.data, offset + 0x1C)
                 )
+            elif stride == 48:
+                # Stage vertices: position, half-float normal, 0xFFFFFFFF, UV.
+                nx, ny, nz = struct.unpack_from("<3e", self.data, offset + 0x0C)
+                u, v = struct.unpack_from("<2e", self.data, offset + 0x18)
+                mesh.uvs.append((u, v) if math.isfinite(u) and math.isfinite(v) else (0.0, 0.0))
             else:
                 # Eye (stride 44) and face (stride 60) vertices use half floats:
                 # RenderDoc event 608 / 90 show normal at 0x0c and UV at 0x18.
