@@ -606,6 +606,75 @@ def cmd_hca(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_render(args: argparse.Namespace) -> int:
+    from .anim import load_motion
+    from .bml import Mesh, find_bml_in_pac
+    from .render import render_textured
+    from .skin import Skeleton, transform_point
+    from .texture import load_texture_archive
+
+    archive = find_bml_in_pac(args.pac, args.character)
+    skeleton = Skeleton(archive.nodes())
+    meshes = archive.meshes()
+    nodes = archive.nodes()
+    draw_nodes = {call.mesh_index: call.node_index for call in archive.draw_calls()}
+    pose_quat: dict[str, tuple[float, float, float, float]] = {}
+    if args.clip:
+        animation = load_motion(args.pac, args.clip)
+        for track in animation.tracks:
+            if track.name not in skeleton.nodes:
+                continue
+            keys = animation.rotation_keys(track)
+            if keys is not None:
+                pose_quat[track.name] = keys.sample(args.frame)
+
+    posed, mapping, skipped = _pose_meshes(
+        archive, skeleton, meshes, None, pose_quat, args.influences
+    )
+    # Eye meshes are stored in their node's local space; place them with the
+    # node's (optionally animated) world matrix.
+    placed: list[Mesh] = []
+    for index, mesh in enumerate(posed):
+        if mesh.stride != 44:
+            placed.append(mesh)
+            continue
+        node_index = draw_nodes.get(index)
+        if node_index is None or node_index >= len(nodes):
+            placed.append(mesh)
+            continue
+        matrix = skeleton.world(nodes[node_index].name, None, pose_quat)
+        positions = [transform_point(matrix, p) for p in mesh.positions]
+        placed.append(
+            Mesh(
+                name=mesh.name,
+                vertex_count=mesh.vertex_count,
+                index_count=mesh.index_count,
+                stride=mesh.stride,
+                positions=positions,
+                normals=mesh.normals,
+                uvs=mesh.uvs,
+                indices=mesh.indices,
+            )
+        )
+
+    textures = load_texture_archive(args.pac)
+    png = render_textured(
+        placed,
+        archive.mesh_materials(),
+        textures,
+        width=args.width,
+        height=args.height,
+    )
+    target = Path(args.out)
+    target.write_bytes(png)
+    rendered = sum(1 for mesh in placed if mesh.stride != 60)
+    print(
+        f"{args.pac}: rendered {rendered} mesh(es), {len(textures)} texture(s), "
+        f"face pass skipped={skipped}, palette={len(mapping)} -> {target}"
+    )
+    return 0
+
+
 def cmd_hexdump(args: argparse.Namespace) -> int:
     data = Path(args.file).read_bytes()
     for line in hexdump(data, offset=args.offset, length=args.length):
@@ -743,6 +812,17 @@ def build_parser() -> argparse.ArgumentParser:
     animate.add_argument("--obj")
     animate.add_argument("--png")
     animate.set_defaults(func=cmd_animate)
+
+    render = sub.add_parser("render", help="textured software preview of a posed model")
+    render.add_argument("pac")
+    render.add_argument("--character", default=None)
+    render.add_argument("--clip", default=None)
+    render.add_argument("--frame", type=float, default=0.0)
+    render.add_argument("--influences", type=int, default=2)
+    render.add_argument("--width", type=int, default=512)
+    render.add_argument("--height", type=int, default=768)
+    render.add_argument("--out", required=True)
+    render.set_defaults(func=cmd_render)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")
