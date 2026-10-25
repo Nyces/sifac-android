@@ -788,7 +788,7 @@ def _formation_from_btlb(pac: Path, count: int) -> list[tuple[float, float]] | N
 def cmd_live(args: argparse.Namespace) -> int:
     from .anim import load_live_motion, sample_pose
     from .bml import Mesh, find_bml_in_pac
-    from .render import Camera, encode_sheet, render_buffer
+    from .render import BACKGROUND, Camera, encode_sheet, render_buffer
     from .skin import Skeleton, place_by_nodes
     from .texture import encode_png, load_texture_archive
 
@@ -939,6 +939,30 @@ def cmd_live(args: argparse.Namespace) -> int:
             camera=frame_camera,
             base=layer,
         )
+        background = bytes(BACKGROUND[:3])
+        filled = 0
+        total = 0
+        count = args.width * args.height
+        for index in range(0, len(pixels), 4):
+            red, green, blue = pixels[index], pixels[index + 1], pixels[index + 2]
+            total += red + green + blue
+            if pixels[index : index + 3] != background:
+                filled += 1
+        share = filled / count
+        mean = total / (count * 3)
+        # A live frame is filled by the stage or by a performer; song 0010's
+        # opening shot covers 100% of the image, while a camera that misses the
+        # stage (song 0050 on st001) covers 1.5%.
+        if share < 0.2:
+            eye = tuple(round(value, 2) for value in frame_camera.position)
+            print(
+                f"warning: frame {frame:g} covers {share:.1%} of the image at a mean "
+                f"luminance of {mean:.0f} (eye={eye}, "
+                f"fov={frame_camera.fov_degrees:.1f}, stage={args.stage}); the camera "
+                "may sit outside the stage, or the stage may not be the one this "
+                "song uses",
+                file=sys.stderr,
+            )
         tiles.append(pixels)
         label = f"frame {frame:g}"
         target_path = Path(args.out)
