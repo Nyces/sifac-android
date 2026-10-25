@@ -741,11 +741,13 @@ def _formation_from_btlb(pac: Path, count: int) -> list[tuple[float, float]] | N
 
     Each record carries ``(x, focus height, depth)``. The ``(x, depth)`` plane
     is the floor plan: song 0010 spans 7.0 x 1.8 m there while either
-    alternative puts two performers 0.14 m apart, and the remaining axis stays
-    at chest height (about 1.4 m). Coincident performers are real — songs with
-    fewer singers park the rest on one spot (0170 puts two records 0.12 m
-    apart) — so the layout is accepted whenever the timeline holds a record per
-    pack, and only implausible coordinates fall back to the placeholder.
+    alternative puts two performers 0.14 m apart, and its third axis sits at
+    chest height (1.2-1.5 m). That third axis is not always a height (song 0020
+    spreads it over 0.5-2.6 m) and is ignored: the stage floor is z=0.
+    Coincident performers are real — songs with fewer singers park the rest on
+    one spot (0170 puts two records 0.12 m apart) — so the layout is accepted
+    whenever the timeline holds a record per pack, and only implausible
+    coordinates fall back to the placeholder.
     """
     from .btlb import load_timelines
 
