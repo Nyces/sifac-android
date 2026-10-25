@@ -128,6 +128,7 @@ class Skeleton:
             if node.parent in self.nodes:
                 self.children[node.parent].append(node.name)
         self._world: dict[str, list[list[float]]] = {}
+        self._segments: list[BoneSegment] | None = None
 
     def local(
         self,
@@ -158,7 +159,14 @@ class Skeleton:
         pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
         basis: str = "absolute",
     ) -> list[list[float]]:
-        """World matrix in mesh space (Z up)."""
+        """World matrix in mesh space (Z up).
+
+        The bind pose (no ``pose``/``pose_quat``) is cached: weight setup and
+        every posed frame ask for it many times.
+        """
+        bind = pose is None and pose_quat is None
+        if bind and name in self._world:
+            return self._world[name]
         chain: list[str] = []
         current: str | None = name
         while current and current in self.nodes:
@@ -174,9 +182,14 @@ class Skeleton:
                 rx, ry, rz = pose[bone]
                 extra = mat_mul(mat_mul(rot_z(rz), rot_y(ry)), rot_x(rx))
             matrix = mat_mul(matrix, self.local(bone, extra, absolute, basis))
-        return mat_mul(mat_mul(_AXIS, matrix), _AXIS_INV)
+        matrix = mat_mul(mat_mul(_AXIS, matrix), _AXIS_INV)
+        if bind:
+            self._world[name] = matrix
+        return matrix
 
     def segments(self) -> list[BoneSegment]:
+        if self._segments is not None:
+            return self._segments
         result: list[BoneSegment] = []
         for name in self.nodes:
             head = transform_point(self.world(name), (0.0, 0.0, 0.0))
@@ -194,6 +207,7 @@ class Skeleton:
             else:
                 tail = (head[0], head[1], head[2] + 0.02)
             result.append(BoneSegment(name, head, tail))
+        self._segments = result
         return result
 
     def leaf_names(self) -> list[str]:

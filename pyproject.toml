@@ -12,6 +12,7 @@ dependencies = []
 [project.optional-dependencies]
 textures = ["texture2ddecoder>=1.0"]
 audio = ["cricodecs>=1.2"]
+gpu = ["moderngl>=5.10", "numpy>=1.24"]
 
 [project.scripts]
 sifac-tools = "sifac.cli:main"

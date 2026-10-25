@@ -408,46 +408,58 @@ def _pose_meshes(
     pose: dict[str, tuple[float, float, float]] | None = None,
     pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
     influences: int = 2,
+    cache: dict | None = None,
 ) -> tuple[list, dict[int, str], int]:
-    """Skin every mesh with either palette weights or automatic weights."""
+    """Skin every mesh with either palette weights or automatic weights.
+
+    ``cache`` keeps the (expensive) palette mapping and per-vertex weights
+    across frames; pass the same bind-pose ``meshes`` every time.
+    """
     from .bml import Mesh
     from .skin import auto_weights, deform, palette_map, weights_from_palette
 
-    biped = [name for name in skeleton.nodes if name.startswith("Bip001_")]
-    hair = [name for name in skeleton.nodes if "_bon_" in name]
-    head = [
-        name for name in skeleton.nodes
-        if name in ("Bip001_Head", "Bip001_Neck", "Honoka_head_set")
-    ]
-    mapping = palette_map(meshes, skeleton, biped + hair + head) if any(
-        mesh.bone_indices for mesh in meshes
-    ) else {}
+    state = cache.get("skin") if cache is not None else None
+    if state is None:
+        biped = [name for name in skeleton.nodes if name.startswith("Bip001_")]
+        hair = [name for name in skeleton.nodes if "_bon_" in name]
+        head = [
+            name for name in skeleton.nodes
+            if name in ("Bip001_Head", "Bip001_Neck", "Honoka_head_set")
+        ]
+        mapping = palette_map(meshes, skeleton, biped + hair + head) if any(
+            mesh.bone_indices for mesh in meshes
+        ) else {}
+        weights_by_mesh: list = []
+        for mesh in meshes:
+            lower = mesh.name.lower()
+            if "hair" in lower:
+                candidates = hair + head
+            elif "face" in lower or "eye" in lower:
+                candidates = head
+            else:
+                candidates = biped
+            if mesh.stride in (44, 60) or not candidates:
+                # Eye and face meshes are rigid (anchored by _attach_rigid_meshes);
+                # stage and prop models have no Biped rig.
+                weights_by_mesh.append(None)
+                continue
+            weights_by_mesh.append(
+                weights_from_palette(mesh, skeleton, mapping, candidates)
+                if mesh.bone_indices and mapping
+                else auto_weights(mesh, skeleton, influences, candidates)
+            )
+        state = (mapping, weights_by_mesh)
+        if cache is not None:
+            cache["skin"] = state
+    mapping, weights_by_mesh = state
+
     posed: list[Mesh] = []
     skipped = 0
-    for mesh in meshes:
-        lower = mesh.name.lower()
-        if "hair" in lower:
-            candidates = hair + head
-        elif "face" in lower or "eye" in lower:
-            candidates = head
-        else:
-            candidates = biped
-        if mesh.stride in (44, 60):
-            # Eye and face meshes are rigid: they are anchored to their node by
-            # _attach_rigid_meshes instead of being skinned.
+    for mesh, weights in zip(meshes, weights_by_mesh):
+        if weights is None:
             posed.append(mesh)
             skipped += 1
             continue
-        if not candidates:
-            # Stage and prop models have no Biped rig; leave the geometry as is.
-            posed.append(mesh)
-            skipped += 1
-            continue
-        weights = (
-            weights_from_palette(mesh, skeleton, mapping, candidates)
-            if mesh.bone_indices and mapping
-            else auto_weights(mesh, skeleton, influences, candidates)
-        )
         positions = deform(mesh.positions, skeleton, weights, pose, pose_quat)
         posed.append(
             Mesh(
@@ -469,12 +481,16 @@ def _attach_rigid_meshes(
     archive: object,
     skeleton: object,
     pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
+    nodes: list | None = None,
+    draw_nodes: dict[int, int] | None = None,
 ) -> list:
     """Anchor eye and face meshes to their owning node."""
     from .skin import anchor_rigid
 
-    nodes = archive.nodes()
-    draw_nodes = {call.mesh_index: call.node_index for call in archive.draw_calls()}
+    if nodes is None:
+        nodes = archive.nodes()
+    if draw_nodes is None:
+        draw_nodes = {call.mesh_index: call.node_index for call in archive.draw_calls()}
     return anchor_rigid(posed, draw_nodes, nodes, skeleton, pose_quat)
 
 
@@ -709,6 +725,22 @@ def cmd_stage(args: argparse.Namespace) -> int:
     )
     target = tuple(args.target) if args.target else tuple(center)
     camera = Camera(position=eye, target=target, fov_degrees=args.fov)
+    if args.gpu:
+        from .gpu import GpuScene, GpuUnavailable
+        from .texture import encode_png
+
+        try:
+            scene = GpuScene(args.width, args.height)
+        except GpuUnavailable as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"gpu: {scene.info}")
+        wire = [(mesh, sub_bindings.get(index)) for index, mesh in enumerate(meshes)]
+        Path(args.out).write_bytes(
+            encode_png(args.width, args.height, scene.render(wire, textures, camera))
+        )
+        print(f"wrote {args.out} (eye={tuple(round(v, 2) for v in eye)})")
+        return 0
     png = render_camera(
         meshes,
         sub_bindings,
@@ -868,16 +900,23 @@ def cmd_live(args: argparse.Namespace) -> int:
             print(f"  skip {pack.name}: {char_pac} not found", file=sys.stderr)
             continue
         model = find_bml_in_pac(char_pac)
-        skeleton = Skeleton(model.nodes())
+        nodes = model.nodes()
+        skeleton = Skeleton(nodes)
         textures.update(load_texture_archive(char_pac))
         models.append(
             {
                 "id": character_id,
                 "model": model,
                 "skeleton": skeleton,
+                "nodes": nodes,
+                "draw_nodes": {
+                    call.mesh_index: call.node_index for call in model.draw_calls()
+                },
+                "meshes": model.meshes(),
                 "motion": load_live_motion(pack),
                 "bindings": model.mesh_materials(),
                 "spot": spots[index],
+                "cache": {},
             }
         )
 
@@ -908,9 +947,22 @@ def cmd_live(args: argparse.Namespace) -> int:
                 f"fov={state.fov_degrees:.1f}"
             )
 
-    stage_layer = None if camera_anim is not None else render_buffer(
-        stage_wire, textures, args.width, args.height, camera=camera
-    )
+    gpu = None
+    if args.gpu:
+        from .gpu import GpuScene, GpuUnavailable
+
+        try:
+            gpu = GpuScene(args.width, args.height)
+        except GpuUnavailable as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"gpu: {gpu.info}")
+
+    stage_layer = None
+    if camera_anim is None and gpu is None:
+        stage_layer = render_buffer(
+            stage_wire, textures, args.width, args.height, camera=camera
+        )
 
     frames = [args.frame]
     if args.frames:
@@ -929,9 +981,22 @@ def cmd_live(args: argparse.Namespace) -> int:
             if not pose:
                 continue
             posed, _, _ = _pose_meshes(
-                model, skeleton, model.meshes(), None, pose, args.influences
+                model,
+                skeleton,
+                entry["meshes"],
+                None,
+                pose,
+                args.influences,
+                cache=entry["cache"],
             )
-            posed = _attach_rigid_meshes(posed, model, skeleton, pose)
+            posed = _attach_rigid_meshes(
+                posed,
+                model,
+                skeleton,
+                pose,
+                nodes=entry["nodes"],
+                draw_nodes=entry["draw_nodes"],
+            )
             offset_x, offset_y = entry["spot"]
             for mesh_index, mesh in enumerate(posed):
                 wire.append(
@@ -964,15 +1029,18 @@ def cmd_live(args: argparse.Namespace) -> int:
         else:
             frame_camera = camera
             layer = stage_layer
-            layer_wire = wire
-        pixels, _depth = render_buffer(
-            layer_wire,
-            textures,
-            args.width,
-            args.height,
-            camera=frame_camera,
-            base=layer,
-        )
+            layer_wire = stage_wire + wire if gpu is not None else wire
+        if gpu is not None:
+            pixels = gpu.render(layer_wire, textures, frame_camera)
+        else:
+            pixels, _depth = render_buffer(
+                layer_wire,
+                textures,
+                args.width,
+                args.height,
+                camera=frame_camera,
+                base=layer,
+            )
         background = bytes(BACKGROUND[:3])
         filled = 0
         total = 0
@@ -1340,6 +1408,11 @@ def build_parser() -> argparse.ArgumentParser:
     stage.add_argument("--height", type=int, default=360)
     stage.add_argument("--out", required=True)
     stage.add_argument("--bounds-only", action="store_true")
+    stage.add_argument(
+        "--gpu",
+        action="store_true",
+        help="rasterise through moderngl/OpenGL instead of the Python software renderer",
+    )
     stage.set_defaults(func=cmd_stage)
 
     live = sub.add_parser("live", help="compose a live stage frame (stage + idols + motion)")
@@ -1374,6 +1447,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("grid", "btlb"),
         default="grid",
         help="performer layout: placeholder grid or the song's character timeline",
+    )
+    live.add_argument(
+        "--gpu",
+        action="store_true",
+        help="rasterise through moderngl/OpenGL instead of the Python software renderer",
     )
     live.add_argument("--sheet", default=None, metavar="PNG")
     live.add_argument("--columns", type=int, default=0)
