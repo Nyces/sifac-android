@@ -35,15 +35,29 @@ meshes without skinning omit the tail block)::
 
     stride 84   0x00 3 x f32 position
                 0x0c 3 x f32 normal
-                0x1c 4 x u8  bone indices (undecompressed weights)
+                0x18 f32      (attribute 1 .w, saved with the normal)
                 0x40 2 x u16 UV (unorm16), followed by extra UV sets
 
     stride 60   0x00 3 x f32 position
                 0x0c 3 x f32 normal
                 0x18 2 x u16 UV (unorm16)
 
-Skin weights are not decoded yet: the tail of the stride-84 vertex does not
-contain a u8 weight quad that sums to 255, so the weight source is still open.
+Vertex attributes as actually bound on the PS4 GPU (confirmed with a RenderDoc
+capture of the retail game, draw of ``Honoka_hair``)::
+
+    attr0  float4  position (w = 1)
+    attr1  float4  normal, .w = 0.1528 on the first hair vertex
+    attr2  float4  all zero on hair
+    attr3  uint4   four bone indices (u8 x 4), e.g. (77, 32, 31, 30)
+    attr4  uint4   zeros on hair
+    attr5  float4  tangent
+    attr6  float4  UV
+
+The file's 84-byte vertex only carries position, normal, tangent and UV: the
+bone index stream is **not** present in the model container, which matches the
+earlier finding that no weight quad exists in the vertex tail. Real skinning
+therefore needs either the GPU-side index stream or the engine's own binding
+step; until then :mod:`sifac.skin` provides automatic weights.
 """
 
 from __future__ import annotations

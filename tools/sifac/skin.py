@@ -1,8 +1,10 @@
 """Approximate skinning for Blade models.
 
 The retail model files do not expose per-vertex bone indices or weights (see
-``bml.py`` for the negative results), so this module computes **automatic
-weights** from the bind-pose skeleton:
+``bml.py`` for the negative results and the GPU-side attribute layout). A
+RenderDoc capture confirms the GPU receives a ``uint4`` of bone indices as
+attribute 3, but that stream is not stored in the model container. So this
+module computes **automatic weights** from the bind-pose skeleton:
 
 1. every bone becomes a segment from its node position to the average position
    of its children (a leaf falls back to a short segment along +Z);
