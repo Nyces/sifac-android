@@ -56,6 +56,31 @@ class Track:
     data_offset: int
 
 
+@dataclass(frozen=True)
+class RotationKeys:
+    """Key times (frames) and matching quaternions (x, y, z, w)."""
+
+    times: list[float]
+    quaternions: list[tuple[float, float, float, float]]
+
+    def sample(self, frame: float) -> tuple[float, float, float, float]:
+        if not self.times:
+            return (0.0, 0.0, 0.0, 1.0)
+        if frame <= self.times[0]:
+            return self.quaternions[0]
+        if frame >= self.times[-1]:
+            return self.quaternions[-1]
+        for index in range(1, len(self.times)):
+            if frame <= self.times[index]:
+                t0, t1 = self.times[index - 1], self.times[index]
+                q0, q1 = self.quaternions[index - 1], self.quaternions[index]
+                if abs(t1 - t0) < 1e-6:
+                    return q1
+                alpha = (frame - t0) / (t1 - t0)
+                return tuple(a + (b - a) * alpha for a, b in zip(q0, q1))  # type: ignore[return-value]
+        return self.quaternions[-1]
+
+
 class BmaAnimation:
     def __init__(self, data: bytes) -> None:
         offset = data.find(b"ANHD")
@@ -123,6 +148,51 @@ class BmaAnimation:
                 return track
         return None
 
+    def payload(self, pointer: int) -> tuple[int, bytes] | None:
+        """Return (size, bytes) when *pointer* targets a DATA payload."""
+        if pointer < 16 or pointer + 12 > len(self.data):
+            return None
+        if self.data[pointer - 12 : pointer - 8] != b"DATA":
+            return None
+        size = u32(self.data, pointer - 8)
+        if size <= 0 or pointer + size > len(self.data):
+            return None
+        return size, self.data[pointer : pointer + size]
+
+    def rotation_keys(self, track: Track) -> RotationKeys | None:
+        """Decode a track's rotation channel (time table + quaternions)."""
+        times: list[float] | None = None
+        quaternions: list[tuple[float, float, float, float]] | None = None
+        for index in range(track.key_count):
+            base = track.data_offset + index * 16
+            if base + 16 > len(self.data):
+                break
+            first, _reserved, second, _kind = struct.unpack_from("<4I", self.data, base)
+            for pointer in (first, second):
+                got = self.payload(pointer)
+                if got is None:
+                    continue
+                size, body = got
+                if size % 16 == 0 and size >= 32:
+                    count = size // 16
+                    values = [struct.unpack_from("<4f", body, i * 16) for i in range(count)]
+                    if all(abs(sum(v * v for v in q) - 1.0) < 0.02 for q in values[:8]):
+                        quaternions = values
+                elif size % 12 == 0 and size >= 24:
+                    count = size // 12
+                    entries = [struct.unpack_from("<fII", body, i * 12) for i in range(count)]
+                    candidate = [entry[0] for entry in entries]
+                    ordered = all(
+                        candidate[i] <= candidate[i + 1] for i in range(len(candidate) - 1)
+                    )
+                    if ordered and candidate[-1] > candidate[0]:
+                        times = candidate
+        if quaternions is None:
+            return None
+        if times is None or len(times) != len(quaternions):
+            times = [float(i) for i in range(len(quaternions))]
+        return RotationKeys(times, quaternions)
+
     def key_blocks(self, track: Track) -> list[bytes]:
         """Split a track's data block into its per-key payloads.
 
@@ -169,6 +239,25 @@ def find_bma_in_pac(path: str | Path, character: str | None = None) -> BmaAnimat
         if entry.type == "BMA":
             return BmaAnimation(bmar.entry_data(index))
     raise BmaError(f"no BMA animation in {path}")
+
+
+def load_motion(path: str | Path, name: str) -> BmaAnimation:
+    """Load one animation from the character's ``motion.pac`` by entry name."""
+    from .arc import ArcArchive
+    from .binary import unwrap_section
+    from .pac import read_pac
+
+    image = read_pac(path)
+    top = ArcArchive(image.data)
+    motion_entry = top.find("motion.pac")
+    if motion_entry is None:
+        raise BmaError(f"motion.pac not found in {path}")
+    motion_bytes, _ = unwrap_section(top.entry_data(motion_entry))
+    motion_arc = ArcArchive(motion_bytes)
+    entry = motion_arc.find(name)
+    if entry is None:
+        raise BmaError(f"motion not found: {name}")
+    return BmaAnimation(motion_arc.entry_data(entry))
 
 
 def list_motions(path: str | Path, character: str | None = None) -> list[dict]:

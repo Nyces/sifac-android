@@ -123,20 +123,33 @@ class Skeleton:
                 self.children[node.parent].append(node.name)
         self._world: dict[str, list[list[float]]] = {}
 
-    def local(self, name: str, extra: list[list[float]] | None = None) -> list[list[float]]:
+    def local(
+        self,
+        name: str,
+        extra: list[list[float]] | None = None,
+        absolute: list[list[float]] | None = None,
+    ) -> list[list[float]]:
         node = self.nodes[name]
         m = identity()
         m[0][3], m[1][3], m[2][3] = node.translation
-        rx, ry, rz = node.rotation
-        rotation = mat_mul(mat_mul(rot_z(rz), rot_y(ry)), rot_x(rx))
-        if extra is not None:
-            rotation = mat_mul(extra, rotation)
+        if absolute is not None:
+            rotation = absolute
+        else:
+            rx, ry, rz = node.rotation
+            rotation = mat_mul(mat_mul(rot_z(rz), rot_y(ry)), rot_x(rx))
+            if extra is not None:
+                rotation = mat_mul(extra, rotation)
         m = mat_mul(m, rotation)
         scale = identity()
         scale[0][0], scale[1][1], scale[2][2] = node.scale
         return mat_mul(m, scale)
 
-    def world(self, name: str, pose: dict[str, tuple[float, float, float]] | None = None) -> list[list[float]]:
+    def world(
+        self,
+        name: str,
+        pose: dict[str, tuple[float, float, float]] | None = None,
+        pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
+    ) -> list[list[float]]:
         """World matrix in mesh space (Z up)."""
         chain: list[str] = []
         current: str | None = name
@@ -146,10 +159,13 @@ class Skeleton:
         matrix = identity()
         for bone in reversed(chain):
             extra = None
-            if pose and bone in pose:
+            absolute = None
+            if pose_quat and bone in pose_quat:
+                absolute = mat_from_quat(pose_quat[bone])
+            elif pose and bone in pose:
                 rx, ry, rz = pose[bone]
                 extra = mat_mul(mat_mul(rot_z(rz), rot_y(ry)), rot_x(rx))
-            matrix = mat_mul(matrix, self.local(bone, extra))
+            matrix = mat_mul(matrix, self.local(bone, extra, absolute))
         return mat_mul(mat_mul(_AXIS, matrix), _AXIS_INV)
 
     def segments(self) -> list[BoneSegment]:
@@ -174,6 +190,18 @@ class Skeleton:
 
     def leaf_names(self) -> list[str]:
         return [name for name in self.nodes if not self.children.get(name)]
+
+
+def mat_from_quat(q: tuple[float, float, float, float]) -> list[list[float]]:
+    x, y, z, w = q
+    length = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / length, y / length, z / length, w / length
+    return [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w), 0.0],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w), 0.0],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y), 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
 
 
 def _distance_to_segment(
@@ -227,12 +255,13 @@ def deform(
     positions: list[tuple[float, float, float]],
     skeleton: Skeleton,
     weights: list[tuple[list[int], list[float]]],
-    pose: dict[str, tuple[float, float, float]],
+    pose: dict[str, tuple[float, float, float]] | None = None,
+    pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
 ) -> list[tuple[float, float, float]]:
-    """Apply a pose (bone name -> extra Euler rotation in radians)."""
+    """Apply a pose (bone name -> extra rotation)."""
     names = sorted({name for bones, _ in weights for name in bones})
     bind = {name: invert(skeleton.world(name)) for name in names}
-    posed = {name: skeleton.world(name, pose) for name in names}
+    posed = {name: skeleton.world(name, pose, pose_quat) for name in names}
     deltas = {name: mat_mul(posed[name], bind[name]) for name in names}
     out: list[tuple[float, float, float]] = []
     for position, (bones, bone_weights) in zip(positions, weights):
