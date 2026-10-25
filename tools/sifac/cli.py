@@ -399,6 +399,76 @@ def cmd_anim(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pose(args: argparse.Namespace) -> int:
+    import math
+
+    from .bml import Mesh, find_bml_in_pac, render_silhouette
+    from .skin import Skeleton, auto_weights, deform
+
+    archive = find_bml_in_pac(args.pac, args.character)
+    skeleton = Skeleton(archive.nodes())
+    biped = [name for name in skeleton.nodes if name.startswith("Bip001_")]
+    hair = [name for name in skeleton.nodes if "_bon_" in name]
+    head = [
+        name for name in skeleton.nodes
+        if name in ("Bip001_Head", "Bip001_Neck", "Honoka_head_set")
+    ]
+    pose: dict[str, tuple[float, float, float]] = {}
+    for spec in args.rotate:
+        name, _, values = spec.partition("=")
+        if not values:
+            print(f"error: invalid --rotate {spec!r}, expected BONE=rx,ry,rz", file=sys.stderr)
+            return 1
+        parts = [float(v) for v in values.split(",")]
+        if len(parts) != 3:
+            print(f"error: invalid --rotate {spec!r}", file=sys.stderr)
+            return 1
+        pose[name.strip()] = tuple(math.radians(v) for v in parts)  # type: ignore[assignment]
+    posed: list[Mesh] = []
+    skipped = 0
+    for mesh in archive.meshes():
+        lower = mesh.name.lower()
+        if "hair" in lower:
+            candidates = hair + head
+        elif "face" in lower or "eye" in lower:
+            candidates = head
+        else:
+            candidates = biped
+        extent = max(
+            (abs(p[0]) + abs(p[1]) + abs(p[2]) for p in mesh.positions), default=0.0
+        )
+        if extent < 0.5:
+            # Eye meshes are stored in their own local space; leave them alone.
+            posed.append(mesh)
+            skipped += 1
+            continue
+        weights = auto_weights(mesh, skeleton, args.influences, candidates)
+        positions = deform(mesh.positions, skeleton, weights, pose)
+        posed.append(
+            Mesh(
+                name=mesh.name,
+                vertex_count=mesh.vertex_count,
+                index_count=mesh.index_count,
+                stride=mesh.stride,
+                positions=positions,
+                normals=mesh.normals,
+                uvs=mesh.uvs,
+                indices=mesh.indices,
+            )
+        )
+    print(
+        f"{args.pac}: posed {len(posed)} mesh(es), {sum(m.vertex_count for m in posed)} vertices, "
+        f"{len(pose)} bone(s) rotated, {skipped} local mesh(es) left as-is"
+    )
+    if args.obj:
+        Path(args.obj).write_text(archive.to_obj_for(posed), encoding="utf-8")
+        print(f"wrote {args.obj}")
+    if args.png:
+        Path(args.png).write_bytes(render_silhouette(posed))
+        print(f"wrote {args.png}")
+    return 0
+
+
 def cmd_hexdump(args: argparse.Namespace) -> int:
     data = Path(args.file).read_bytes()
     for line in hexdump(data, offset=args.offset, length=args.length):
@@ -505,6 +575,15 @@ def build_parser() -> argparse.ArgumentParser:
     anim.add_argument("--list", action="store_true")
     anim.add_argument("--limit", type=int, default=15)
     anim.set_defaults(func=cmd_anim)
+
+    pose = sub.add_parser("pose", help="apply an approximate pose and export the result")
+    pose.add_argument("pac")
+    pose.add_argument("--character", default=None)
+    pose.add_argument("--rotate", action="append", default=[], metavar="BONE=rx,ry,rz")
+    pose.add_argument("--influences", type=int, default=2)
+    pose.add_argument("--obj")
+    pose.add_argument("--png")
+    pose.set_defaults(func=cmd_pose)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")

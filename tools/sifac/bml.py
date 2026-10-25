@@ -305,10 +305,13 @@ class BmlArchive:
         return mesh
 
     def to_obj(self, with_uv: bool = True) -> str:
+        return self.to_obj_for(self.meshes(), with_uv=with_uv)
+
+    def to_obj_for(self, meshes: list["Mesh"], with_uv: bool = True) -> str:
         lines = ["# SIFAC Blade model (read-only extraction)"]
         materials = self.mesh_materials()
         base = 1
-        for mesh_index, mesh in enumerate(self.meshes()):
+        for mesh_index, mesh in enumerate(meshes):
             lines.append(f"o {mesh.name or 'mesh'}")
             material = materials.get(mesh_index)
             if material:
