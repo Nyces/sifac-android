@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from .texture import BtxTexture, encode_png
 
 BACKGROUND = (16, 18, 24, 255)
+ADDITIVE_GAIN = 0.35
+ADDITIVE_NAMES = ("lightbar", "floor_frame", "yuka_led", "mon_dotmask")
 
 
 @dataclass(frozen=True)
@@ -340,6 +342,24 @@ def _mip_from_world(scale: float, pa, pb, pc, screen_area: float, limit: int) ->
     return max(0, min(int(math.log2(ratio)), limit))
 
 
+def _additive(material) -> bool:
+    """True for the glow layers that the game draws additively.
+
+    The blend mode is not stored in the model: every ``MATE`` chunk is 72 bytes
+    with no flags and every ``DRAW`` entry has ``flags = 0``. The stage's glow
+    quads can be recognised by name instead — their textures are bright masks
+    (``s01_floorglow_mask`` averages 198,198,198) that are meant to brighten the
+    surface below rather than cover it. Drawing them as opaque geometry paints
+    flat grey sheets over the dance floor.
+    """
+    if material is None:
+        return False
+    name = (getattr(material, "name", "") or "").lower()
+    if name.startswith("glow"):
+        return True
+    return any(token in name for token in ADDITIVE_NAMES)
+
+
 def render_buffer(
     wire: list,
     textures: dict[str, BtxTexture],
@@ -356,6 +376,12 @@ def render_buffer(
     keeps per-frame live renders cheap: only the characters are rasterised.
     """
     items = _decode(wire, textures)
+    flags = [_additive(material) for _mesh, material in wire]
+    # Additive layers are rasterised last and never write depth, so they
+    # brighten whatever lies behind them without hiding it.
+    order = sorted(range(len(items)), key=lambda index: flags[index])
+    items = [items[index] for index in order]
+    flags = [flags[index] for index in order]
     meshes = [mesh for mesh, _canvas in items]
     if not meshes and base is None:
         raise ValueError("no meshes to render")
@@ -384,7 +410,7 @@ def render_buffer(
             min_x = min_z = 0.0
             scale = 1.0
 
-    for mesh, canvas in items:
+    for (mesh, canvas), additive in zip(items, flags):
         if not mesh.indices:
             continue
         if camera is None:
@@ -514,6 +540,8 @@ def render_buffer(
                         u = (w0 * ua[0] * ia + w1 * ub[0] * ib + w2 * uc[0] * ic) / inv_w
                         v = (w0 * ua[1] * ia + w1 * ub[1] * ib + w2 * uc[1] * ic) / inv_w
                         if not (math.isfinite(u) and math.isfinite(v)):
+                            if additive:
+                                continue
                             color = (180, 180, 180, 255)
                             depth[index] = z
                             pixels[index * 4 : index * 4 + 4] = bytes(color)
@@ -530,8 +558,19 @@ def render_buffer(
                     if not math.isfinite(lambert):
                         lambert = 1.0
                     shade = 0.72 + 0.28 * min(1.0, lambert)
+                    offset = index * 4
+                    if additive:
+                        gain = shade * ADDITIVE_GAIN
+                        pixels[offset] = min(255, pixels[offset] + int(color[0] * gain))
+                        pixels[offset + 1] = min(
+                            255, pixels[offset + 1] + int(color[1] * gain)
+                        )
+                        pixels[offset + 2] = min(
+                            255, pixels[offset + 2] + int(color[2] * gain)
+                        )
+                        continue
                     depth[index] = z
-                    pixels[index * 4 : index * 4 + 4] = bytes(
+                    pixels[offset : offset + 4] = bytes(
                         (
                             min(255, int(color[0] * shade)),
                             min(255, int(color[1] * shade)),

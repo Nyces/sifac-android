@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from sifac.bml import Mesh
 from sifac.render import (
+    _additive,
     _repair_uvs,
     _uv_scale,
     encode_sheet,
@@ -100,6 +101,12 @@ class RenderTests(unittest.TestCase):
         self.assertIsNotNone(scale)
         # Each grid cell spans 1 world unit and 0.1 UV -> 51.2 texels per unit.
         self.assertAlmostEqual(scale, 51.2, delta=1.0)
+
+    def test_additive_layers_are_recognised(self) -> None:
+        self.assertFalse(_additive(None))
+        self.assertFalse(_additive(SimpleNamespace(name="wall_mt", texture="s01_walls")))
+        self.assertTrue(_additive(SimpleNamespace(name="Glow_Floor_A_mt", texture="x")))
+        self.assertTrue(_additive(SimpleNamespace(name="Floor_frame_mt", texture="x")))
 
 
 if __name__ == "__main__":
