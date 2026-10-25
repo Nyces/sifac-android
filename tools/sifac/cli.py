@@ -740,9 +740,9 @@ def _formation(count: int, spacing: float = 2.2, depth: float = 1.7) -> list[tup
 def cmd_live(args: argparse.Namespace) -> int:
     from .anim import load_live_motion, sample_pose
     from .bml import Mesh, find_bml_in_pac
-    from .render import Camera, render_meshes
+    from .render import Camera, encode_sheet, render_buffer
     from .skin import Skeleton, place_by_nodes
-    from .texture import load_texture_archive
+    from .texture import encode_png, load_texture_archive
 
     live_dir = Path(args.live)
     song = args.song or live_dir.name
@@ -757,7 +757,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         stage.meshes(), stage_draw, stage_nodes, stage_skeleton
     )
     stage_bindings = stage.mesh_materials()
-    wire: list[tuple[object, object]] = [
+    stage_wire: list[tuple[object, object]] = [
         (mesh, stage_bindings.get(index)) for index, mesh in enumerate(stage_meshes)
     ]
     textures = dict(load_texture_archive(stage_pac))
@@ -774,6 +774,7 @@ def cmd_live(args: argparse.Namespace) -> int:
     spots = _formation(len(packs))
     print(f"song {song}: {len(packs)} character pack(s)")
 
+    models = []
     for index, pack in enumerate(packs):
         character_id = pack.name[:3]
         char_pac = root / "chr" / character_id / f"{character_id}.pac"
@@ -782,46 +783,82 @@ def cmd_live(args: argparse.Namespace) -> int:
             continue
         model = find_bml_in_pac(char_pac)
         skeleton = Skeleton(model.nodes())
-        pose = sample_pose(load_live_motion(pack), set(skeleton.nodes), args.frame)
-        if not pose:
-            print(f"  skip {pack.name}: no matching tracks", file=sys.stderr)
-            continue
-        posed, _, _ = _pose_meshes(model, skeleton, model.meshes(), None, pose, args.influences)
-        posed = _attach_rigid_meshes(posed, model, skeleton, pose)
-        bindings = model.mesh_materials()
         textures.update(load_texture_archive(char_pac))
-        offset_x, offset_y = spots[index]
-        for mesh_index, mesh in enumerate(posed):
-            material = bindings.get(mesh_index)
-            wire.append(
-                (
-                    Mesh(
-                        name=f"{character_id}/{mesh.name}",
-                        vertex_count=mesh.vertex_count,
-                        index_count=mesh.index_count,
-                        stride=mesh.stride,
-                        positions=[
-                            (p[0] + offset_x, p[1] + offset_y, p[2] + stage_top)
-                            for p in mesh.positions
-                        ],
-                        normals=mesh.normals,
-                        uvs=mesh.uvs,
-                        indices=mesh.indices,
-                    ),
-                    material,
-                )
-            )
-        print(
-            f"  {character_id}: {len(pose)} track(s), "
-            f"{sum(m.vertex_count for m in posed)} vertices at ({offset_x:.1f}, {offset_y:.1f})"
+        models.append(
+            {
+                "id": character_id,
+                "model": model,
+                "skeleton": skeleton,
+                "motion": load_live_motion(pack),
+                "bindings": model.mesh_materials(),
+                "spot": spots[index],
+            }
         )
 
     eye = tuple(args.eye) if args.eye else (0.0, -9.0, stage_top + 1.6)
     target = tuple(args.target) if args.target else (0.0, 1.6, stage_top + 0.6)
     camera = Camera(position=eye, target=target, fov_degrees=args.fov)
-    png = render_meshes(wire, textures, args.width, args.height, camera=camera)
-    Path(args.out).write_bytes(png)
-    print(f"wrote {args.out}")
+    stage_layer = render_buffer(
+        stage_wire, textures, args.width, args.height, camera=camera
+    )
+
+    frames = [args.frame]
+    if args.frames:
+        start, end, step = (int(v) for v in args.frames.split(":"))
+        frames = list(range(start, end + 1, max(1, step)))
+    print(f"frames: {len(frames)}")
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+
+    tiles: list[bytes] = []
+    for frame in frames:
+        wire: list[tuple[object, object]] = []
+        for entry in models:
+            model = entry["model"]
+            skeleton = entry["skeleton"]
+            pose = sample_pose(entry["motion"], set(skeleton.nodes), frame)
+            if not pose:
+                continue
+            posed, _, _ = _pose_meshes(
+                model, skeleton, model.meshes(), None, pose, args.influences
+            )
+            posed = _attach_rigid_meshes(posed, model, skeleton, pose)
+            offset_x, offset_y = entry["spot"]
+            for mesh_index, mesh in enumerate(posed):
+                wire.append(
+                    (
+                        Mesh(
+                            name=f"{entry['id']}/{mesh.name}",
+                            vertex_count=mesh.vertex_count,
+                            index_count=mesh.index_count,
+                            stride=mesh.stride,
+                            positions=[
+                                (p[0] + offset_x, p[1] + offset_y, p[2] + stage_top)
+                                for p in mesh.positions
+                            ],
+                            normals=mesh.normals,
+                            uvs=mesh.uvs,
+                            indices=mesh.indices,
+                        ),
+                        entry["bindings"].get(mesh_index),
+                    )
+                )
+        pixels, _depth = render_buffer(
+            wire, textures, args.width, args.height, camera=camera, base=stage_layer
+        )
+        tiles.append(pixels)
+        label = f"frame {frame:g}"
+        target_path = Path(args.out)
+        if len(frames) > 1:
+            target_path = target_path.with_name(f"{target_path.stem}_{frame:06d}{target_path.suffix}")
+        target_path.write_bytes(encode_png(args.width, args.height, pixels))
+        print(f"  {label} -> {target_path.name}")
+
+    if args.sheet:
+        columns = args.columns or min(4, len(tiles))
+        Path(args.sheet).write_bytes(
+            encode_sheet(tiles, args.width, args.height, columns)
+        )
+        print(f"wrote {args.sheet}")
 
     if args.audio:
         from .audio import decode_hca, read_hca_info, read_wav_info
@@ -842,7 +879,7 @@ def cmd_live(args: argparse.Namespace) -> int:
             f"{wav_info.duration:.2f}s)"
         )
         print(
-            f"  frame {args.frame:g} at 60 fps = {args.frame / 60.0:.2f}s, "
+            f"  frame {frames[0]:g} at 60 fps = {frames[0] / 60.0:.2f}s, "
             f"track length {info.duration:.2f}s"
         )
     return 0
@@ -1025,6 +1062,9 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--height", type=int, default=270)
     live.add_argument("--out", required=True)
     live.add_argument("--audio", default=None, metavar="WAV")
+    live.add_argument("--frames", default=None, metavar="START:END:STEP")
+    live.add_argument("--sheet", default=None, metavar="PNG")
+    live.add_argument("--columns", type=int, default=0)
     live.set_defaults(func=cmd_live)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")

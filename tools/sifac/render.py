@@ -184,7 +184,7 @@ def _mip_level(surface: "_Surface", ua, ub, uc, screen_area: float) -> int:
     return max(0, min(int(math.log2(ratio)), limit))
 
 
-def render_meshes(
+def render_buffer(
     wire: list,
     textures: dict[str, BtxTexture],
     width: int = 512,
@@ -192,25 +192,41 @@ def render_meshes(
     camera: Camera | None = None,
     background: tuple[int, int, int, int] = BACKGROUND,
     ortho_margin: int = 16,
-) -> bytes:
-    """Rasterise (mesh, material) pairs with a directional light."""
+    base: tuple[bytes, list[float]] | None = None,
+) -> tuple[bytes, list[float]]:
+    """Rasterise (mesh, material) pairs into an RGBA buffer plus a depth buffer.
+
+    Passing ``base`` reuses a previously rendered layer (the static stage), which
+    keeps per-frame live renders cheap: only the characters are rasterised.
+    """
     items = _decode(wire, textures)
     meshes = [mesh for mesh, _canvas in items]
-    if not meshes:
+    if not meshes and base is None:
         raise ValueError("no meshes to render")
 
-    pixels = bytearray(width * height * 4)
-    for i in range(width * height):
-        pixels[i * 4 : i * 4 + 4] = bytes(background)
-    depth = [float("inf")] * (width * height)
+    if base is None:
+        pixels = bytearray(width * height * 4)
+        for i in range(width * height):
+            pixels[i * 4 : i * 4 + 4] = bytes(background)
+        depth = [float("inf")] * (width * height)
+    else:
+        pixels = bytearray(base[0])
+        depth = list(base[1])
 
     light = _normalize((-0.4, -0.85, 0.35))
 
     if camera is None:
-        min_x, max_x, min_z, max_z = _screen_bounds(meshes)
-        span_x = max(max_x - min_x, 1e-6)
-        span_z = max(max_z - min_z, 1e-6)
-        scale = min((width - 2 * ortho_margin) / span_x, (height - 2 * ortho_margin) / span_z)
+        if meshes:
+            min_x, max_x, min_z, max_z = _screen_bounds(meshes)
+            span_x = max(max_x - min_x, 1e-6)
+            span_z = max(max_z - min_z, 1e-6)
+            scale = min(
+                (width - 2 * ortho_margin) / span_x,
+                (height - 2 * ortho_margin) / span_z,
+            )
+        else:
+            min_x = min_z = 0.0
+            scale = 1.0
 
     for mesh, canvas in items:
         if not mesh.indices:
@@ -349,7 +365,57 @@ def render_meshes(
                             255,
                         )
                     )
+    return bytes(pixels), depth
+
+
+def encode_sheet(
+    tiles: list[bytes],
+    tile_width: int,
+    tile_height: int,
+    columns: int,
+    background: tuple[int, int, int, int] = BACKGROUND,
+) -> bytes:
+    """Tile several RGBA frames into one PNG (a contact sheet)."""
+    if not tiles:
+        raise ValueError("no tiles to compose")
+    columns = max(1, min(columns, len(tiles)))
+    rows = (len(tiles) + columns - 1) // columns
+    width = tile_width * columns
+    height = tile_height * rows
+    pixels = bytearray(width * height * 4)
+    for index in range(width * height):
+        pixels[index * 4 : index * 4 + 4] = bytes(background)
+    stride = tile_width * 4
+    for index, tile in enumerate(tiles):
+        column = index % columns
+        row = index // columns
+        for y in range(tile_height):
+            source = y * stride
+            target = ((row * tile_height + y) * width + column * tile_width) * 4
+            pixels[target : target + stride] = tile[source : source + stride]
     return encode_png(width, height, bytes(pixels))
+
+
+def render_meshes(
+    wire: list,
+    textures: dict[str, BtxTexture],
+    width: int = 512,
+    height: int = 768,
+    camera: Camera | None = None,
+    background: tuple[int, int, int, int] = BACKGROUND,
+    ortho_margin: int = 16,
+) -> bytes:
+    """Rasterise (mesh, material) pairs and return a PNG."""
+    pixels, _depth = render_buffer(
+        wire,
+        textures,
+        width,
+        height,
+        camera=camera,
+        background=background,
+        ortho_margin=ortho_margin,
+    )
+    return encode_png(width, height, pixels)
 
 
 def render_textured(
