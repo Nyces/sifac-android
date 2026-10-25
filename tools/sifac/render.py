@@ -1,10 +1,9 @@
 """Software textured preview for posed Blade meshes.
 
-The body and hair meshes store world-space vertices and skin normally. Eye
-meshes (stride 44) are stored in their node's local space, so they are placed
-with that node's world matrix. The face mesh (stride 60) belongs to the game's
-separate face pass (RenderDoc event 90 renders it into its own target), so it is
-skipped instead of being drawn in the wrong space.
+Body and hair meshes store world-space vertices and skin normally. Eye meshes
+(stride 44) are stored in their node's local space and face meshes (stride 60)
+carry an origin at the character root, so both must be anchored to their node
+before rendering; ``sifac.cli._attach_rigid_meshes`` does that.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ def render_textured(
     textures: dict[str, BtxTexture],
     width: int = 512,
     height: int = 768,
-    skip_strides: tuple[int, ...] = (60,),
 ) -> bytes:
     """Rasterise meshes with their btx textures and a simple directional light."""
     min_x, max_x, min_z, max_z = _screen_bounds(meshes)
@@ -69,7 +67,7 @@ def render_textured(
         return decoded[key]
 
     for mesh_index, mesh in enumerate(meshes):
-        if mesh.stride in skip_strides or not mesh.indices:
+        if not mesh.indices:
             continue
         canvas = texture_for(mesh_index)
         for triangle in range(mesh.triangle_count):

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .bml import Mesh, Node
 
@@ -107,6 +107,10 @@ def transform_point(m: list[list[float]], p: tuple[float, float, float]) -> tupl
         m[1][0] * x + m[1][1] * y + m[1][2] * z + m[1][3],
         m[2][0] * x + m[2][1] * y + m[2][2] * z + m[2][3],
     )
+
+
+def matrix_translation(m: list[list[float]]) -> tuple[float, float, float]:
+    return (m[0][3], m[1][3], m[2][3])
 
 
 @dataclass(frozen=True)
@@ -318,6 +322,45 @@ def weights_from_palette(
         total = sum(weight for weight, _ in scored) or 1.0
         result.append(([n for _, n in scored], [w / total for w, _ in scored]))
     return result
+
+
+def anchor_rigid(
+    meshes: list[Mesh],
+    draw_nodes: dict[int, int],
+    nodes: list[Node],
+    skeleton: "Skeleton",
+    pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
+) -> list[Mesh]:
+    """Place eye (stride 44) and face (stride 60) meshes with their owning node.
+
+    Eye meshes are authored in node-local space and need the full world matrix.
+    Face meshes are already Z-up and correctly scaled, but their origin sits at
+    the character root instead of the head, so only the node translation applies.
+    Verified on Honoka, Eli and Nico: every face ends up between the neck and the
+    hair with its eyes at roughly half of the face height.
+    """
+    placed: list[Mesh] = []
+    for index, mesh in enumerate(meshes):
+        node_index = draw_nodes.get(index)
+        if mesh.stride not in (44, 60) or node_index is None or node_index >= len(nodes):
+            placed.append(mesh)
+            continue
+        node_name = nodes[node_index].name
+        posed = skeleton.world(node_name, None, pose_quat)
+        if mesh.stride == 44:
+            positions = [transform_point(posed, p) for p in mesh.positions]
+        else:
+            # The face origin sits at the character root, so first shift it to
+            # the bind anchor and then carry it along with the node's delta.
+            bind = skeleton.world(node_name)
+            delta = mat_mul(posed, invert(bind))
+            tx, ty, tz = matrix_translation(bind)
+            positions = [
+                transform_point(delta, (p[0] + tx, p[1] + ty, p[2] + tz))
+                for p in mesh.positions
+            ]
+        placed.append(replace(mesh, positions=positions))
+    return placed
 
 
 def _bind_rotation(node: Node) -> list[list[float]]:

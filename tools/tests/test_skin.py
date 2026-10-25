@@ -6,6 +6,7 @@ import unittest
 from sifac.bml import Mesh, Node
 from sifac.skin import (
     Skeleton,
+    anchor_rigid,
     auto_weights,
     deform,
     invert,
@@ -165,6 +166,52 @@ class PaletteTests(unittest.TestCase):
         self.assertEqual(weights[1][0], ["Bip001_Spine"])
         for _bones, values in weights:
             self.assertAlmostEqual(sum(values), 1.0, places=5)
+
+
+class AnchorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.skeleton = Skeleton(
+            [
+                node(0, "Root", "", (0.0, 0.0, 0.0)),
+                node(1, "Head", "Root", (0.0, 1.4, 0.0)),
+            ]
+        )
+        self.nodes = list(self.skeleton.nodes.values())
+
+    def mesh(self, stride: int, positions: list[tuple[float, float, float]]) -> Mesh:
+        return Mesh(
+            name=f"m{stride}",
+            vertex_count=len(positions),
+            index_count=0,
+            stride=stride,
+            positions=positions,
+            normals=[(0.0, 0.0, 1.0) for _ in positions],
+            uvs=[(0.0, 0.0) for _ in positions],
+            indices=[],
+        )
+
+    def test_face_mesh_only_moves_by_node_origin(self) -> None:
+        face = self.mesh(60, [(0.1, 0.0, 0.2), (-0.1, 0.05, 0.3)])
+        placed = anchor_rigid([face], {0: 1}, self.nodes, self.skeleton)
+        # Node translation (0, 1.4, 0) in node space becomes (0, 0, 1.4) in mesh space.
+        self.assertAlmostEqual(placed[0].positions[0][2], 1.6, places=5)
+        self.assertAlmostEqual(placed[0].positions[0][0], 0.1, places=5)
+        self.assertAlmostEqual(placed[0].positions[1][2], 1.7, places=5)
+
+    def test_eye_mesh_uses_full_matrix(self) -> None:
+        eye = self.mesh(44, [(0.01, 0.02, 0.03)])
+        placed = anchor_rigid([eye], {0: 1}, self.nodes, self.skeleton)
+        self.assertAlmostEqual(placed[0].positions[0][2], 1.43, places=5)
+
+    def test_skinned_mesh_is_untouched(self) -> None:
+        body = self.mesh(84, [(0.0, 0.0, 1.0)])
+        placed = anchor_rigid([body], {0: 1}, self.nodes, self.skeleton)
+        self.assertIs(placed[0], body)
+
+    def test_unmapped_mesh_is_untouched(self) -> None:
+        face = self.mesh(60, [(0.0, 0.0, 0.0)])
+        placed = anchor_rigid([face], {}, self.nodes, self.skeleton)
+        self.assertIs(placed[0], face)
 
 
 if __name__ == "__main__":

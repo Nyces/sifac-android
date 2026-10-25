@@ -32,7 +32,7 @@ class RenderTests(unittest.TestCase):
         png = render_textured([mesh], bindings, {"red": texture}, width=64, height=64)
         self.assertTrue(png.startswith(b"\x89PNG"))
 
-    def test_face_stride_is_skipped(self) -> None:
+    def test_face_stride_renders_once_anchored(self) -> None:
         mesh = make_quad()
         mesh.stride = 60
         png = render_textured([mesh], {}, {}, width=32, height=32)

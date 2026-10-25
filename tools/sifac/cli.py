@@ -431,11 +431,9 @@ def _pose_meshes(
             candidates = head
         else:
             candidates = biped
-        extent = max(
-            (abs(p[0]) + abs(p[1]) + abs(p[2]) for p in mesh.positions), default=0.0
-        )
-        if extent < 0.5:
-            # Eye meshes are stored in their own local space; leave them alone.
+        if mesh.stride in (44, 60):
+            # Eye and face meshes are rigid: they are anchored to their node by
+            # _attach_rigid_meshes instead of being skinned.
             posed.append(mesh)
             skipped += 1
             continue
@@ -460,6 +458,20 @@ def _pose_meshes(
     return posed, mapping, skipped
 
 
+def _attach_rigid_meshes(
+    posed: list,
+    archive: object,
+    skeleton: object,
+    pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
+) -> list:
+    """Anchor eye and face meshes to their owning node."""
+    from .skin import anchor_rigid
+
+    nodes = archive.nodes()
+    draw_nodes = {call.mesh_index: call.node_index for call in archive.draw_calls()}
+    return anchor_rigid(posed, draw_nodes, nodes, skeleton, pose_quat)
+
+
 def cmd_pose(args: argparse.Namespace) -> int:
     import math
 
@@ -481,9 +493,10 @@ def cmd_pose(args: argparse.Namespace) -> int:
             return 1
         pose[name.strip()] = tuple(math.radians(v) for v in parts)  # type: ignore[assignment]
     posed, mapping, skipped = _pose_meshes(archive, skeleton, meshes, pose, None, args.influences)
+    posed = _attach_rigid_meshes(posed, archive, skeleton)
     print(
         f"{args.pac}: posed {len(posed)} mesh(es), {sum(m.vertex_count for m in posed)} vertices, "
-        f"{len(pose)} bone(s) rotated, {skipped} local mesh(es) left as-is, "
+        f"{len(pose)} bone(s) rotated, {skipped} rigid mesh(es) anchored, "
         f"palette={len(mapping)}"
     )
     if args.obj:
@@ -523,10 +536,11 @@ def cmd_animate(args: argparse.Namespace) -> int:
     posed, mapping, skipped = _pose_meshes(
         archive, skeleton, meshes, None, pose_quat, args.influences
     )
+    posed = _attach_rigid_meshes(posed, archive, skeleton, pose_quat)
     print(
         f"{args.pac}: {args.clip} frame={args.frame:g}/{last_frame:g}, "
         f"{len(pose_quat)} track(s) applied, {len(missing)} unmatched, "
-        f"palette={len(mapping)}, {skipped} local mesh(es) left as-is"
+        f"palette={len(mapping)}, {skipped} rigid mesh(es) anchored"
     )
     if args.obj:
         Path(args.obj).write_text(archive.to_obj_for(posed), encoding="utf-8")
@@ -608,16 +622,14 @@ def cmd_hca(args: argparse.Namespace) -> int:
 
 def cmd_render(args: argparse.Namespace) -> int:
     from .anim import load_motion
-    from .bml import Mesh, find_bml_in_pac
+    from .bml import find_bml_in_pac
     from .render import render_textured
-    from .skin import Skeleton, transform_point
+    from .skin import Skeleton
     from .texture import load_texture_archive
 
     archive = find_bml_in_pac(args.pac, args.character)
     skeleton = Skeleton(archive.nodes())
     meshes = archive.meshes()
-    nodes = archive.nodes()
-    draw_nodes = {call.mesh_index: call.node_index for call in archive.draw_calls()}
     pose_quat: dict[str, tuple[float, float, float, float]] = {}
     if args.clip:
         animation = load_motion(args.pac, args.clip)
@@ -631,31 +643,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     posed, mapping, skipped = _pose_meshes(
         archive, skeleton, meshes, None, pose_quat, args.influences
     )
-    # Eye meshes are stored in their node's local space; place them with the
-    # node's (optionally animated) world matrix.
-    placed: list[Mesh] = []
-    for index, mesh in enumerate(posed):
-        if mesh.stride != 44:
-            placed.append(mesh)
-            continue
-        node_index = draw_nodes.get(index)
-        if node_index is None or node_index >= len(nodes):
-            placed.append(mesh)
-            continue
-        matrix = skeleton.world(nodes[node_index].name, None, pose_quat)
-        positions = [transform_point(matrix, p) for p in mesh.positions]
-        placed.append(
-            Mesh(
-                name=mesh.name,
-                vertex_count=mesh.vertex_count,
-                index_count=mesh.index_count,
-                stride=mesh.stride,
-                positions=positions,
-                normals=mesh.normals,
-                uvs=mesh.uvs,
-                indices=mesh.indices,
-            )
-        )
+    placed = _attach_rigid_meshes(posed, archive, skeleton, pose_quat)
 
     textures = load_texture_archive(args.pac)
     png = render_textured(
@@ -667,10 +655,9 @@ def cmd_render(args: argparse.Namespace) -> int:
     )
     target = Path(args.out)
     target.write_bytes(png)
-    rendered = sum(1 for mesh in placed if mesh.stride != 60)
     print(
-        f"{args.pac}: rendered {rendered} mesh(es), {len(textures)} texture(s), "
-        f"face pass skipped={skipped}, palette={len(mapping)} -> {target}"
+        f"{args.pac}: rendered {len(placed)} mesh(es), {len(textures)} texture(s), "
+        f"{skipped} rigid mesh(es) anchored, palette={len(mapping)} -> {target}"
     )
     return 0
 

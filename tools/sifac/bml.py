@@ -63,6 +63,11 @@ bone index stream is **not** present in the model container, which matches the
 earlier finding that no weight quad exists in the vertex tail. Real skinning
 therefore needs either the GPU-side index stream or the engine's own binding
 step; until then :mod:`sifac.skin` provides automatic weights.
+
+Eye (stride 44) and face (stride 60) meshes are rigid: their DRAW node carries
+the placement. Eyes are authored in node-local space, while the face mesh is a
+full head whose origin sits at the character root, so only the node translation
+applies. :func:`sifac.skin.anchor_rigid` implements both cases.
 """
 
 from __future__ import annotations
