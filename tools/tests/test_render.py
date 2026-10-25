@@ -4,7 +4,13 @@ import unittest
 from types import SimpleNamespace
 
 from sifac.bml import Mesh
-from sifac.render import encode_sheet, render_buffer, render_textured
+from sifac.render import (
+    _repair_uvs,
+    _uv_scale,
+    encode_sheet,
+    render_buffer,
+    render_textured,
+)
 from sifac.texture import BtxTexture
 
 from tests.helpers import build_btx
@@ -20,6 +26,27 @@ def make_quad() -> Mesh:
         normals=[(0.0, -1.0, 0.0)] * 4,
         uvs=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
         indices=[0, 1, 2, 0, 2, 3],
+    )
+
+
+def make_grid() -> Mesh:
+    """3x3 grid with a planar mapping: u = 0.1 * x, v = 0.1 * z."""
+    positions = [(float(x), 0.0, float(z)) for z in range(3) for x in range(3)]
+    uvs = [(0.1 * x, 0.1 * z) for z in range(3) for x in range(3)]
+    indices = []
+    for z in range(2):
+        for x in range(2):
+            a = z * 3 + x
+            indices += [a, a + 1, a + 4, a, a + 4, a + 3]
+    return Mesh(
+        name="grid",
+        vertex_count=9,
+        index_count=len(indices),
+        stride=48,
+        positions=positions,
+        normals=[(0.0, 0.0, 1.0)] * 9,
+        uvs=uvs,
+        indices=indices,
     )
 
 
@@ -55,6 +82,24 @@ class RenderTests(unittest.TestCase):
         tile = bytes((255, 0, 0, 255)) * (8 * 8)
         png = encode_sheet([tile, tile, tile], 8, 8, columns=2)
         self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_uv_repair_restores_planar_mapping(self) -> None:
+        mesh = make_grid()
+        mesh.uvs[4] = (5000.0, -32000.0)
+        repaired = _repair_uvs(mesh)
+        self.assertIsNotNone(repaired)
+        self.assertAlmostEqual(repaired[4][0], 0.1, places=3)
+        self.assertAlmostEqual(repaired[4][1], 0.1, places=3)
+
+    def test_uv_repair_skips_coherent_mesh(self) -> None:
+        self.assertIsNone(_repair_uvs(make_grid()))
+
+    def test_uv_scale_is_median(self) -> None:
+        mesh = make_grid()
+        scale = _uv_scale(mesh, mesh.uvs, 512, 512)
+        self.assertIsNotNone(scale)
+        # Each grid cell spans 1 world unit and 0.1 UV -> 51.2 texels per unit.
+        self.assertAlmostEqual(scale, 51.2, delta=1.0)
 
 
 if __name__ == "__main__":

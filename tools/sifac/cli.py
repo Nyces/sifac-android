@@ -762,11 +762,11 @@ def cmd_live(args: argparse.Namespace) -> int:
     ]
     textures = dict(load_texture_archive(stage_pac))
 
-    stage_top = 0.0
+    floor_top = 0.0
     for mesh in stage_meshes:
-        if "stage_top" in mesh.name.lower() or mesh.name.lower().startswith("mainfloor"):
-            stage_top = max(stage_top, mesh.bounds()[1][2])
-    print(f"stage {args.stage}: {len(stage_meshes)} mesh(es), platform top z={stage_top:.2f}")
+        if "mainfloor" in mesh.name.lower():
+            floor_top = max(floor_top, mesh.bounds()[1][2])
+    print(f"stage {args.stage}: {len(stage_meshes)} mesh(es), dance floor z={floor_top:.2f}")
 
     packs = sorted(live_dir.glob(f"c??_{song}.pac"))
     if args.characters:
@@ -795,10 +795,34 @@ def cmd_live(args: argparse.Namespace) -> int:
             }
         )
 
-    eye = tuple(args.eye) if args.eye else (0.0, -9.0, stage_top + 1.6)
-    target = tuple(args.target) if args.target else (0.0, 1.6, stage_top + 0.6)
+    eye = tuple(args.eye) if args.eye else (0.0, -9.0, floor_top + 1.6)
+    target = tuple(args.target) if args.target else (0.0, 1.6, floor_top + 0.6)
     camera = Camera(position=eye, target=target, fov_degrees=args.fov)
-    stage_layer = render_buffer(
+
+    camera_anim = None
+    if args.camera_anim:
+        from .bscam import BscamError, load_scene_camera
+
+        song_pac = live_dir / f"{song}.pac"
+        try:
+            camera_anim = load_scene_camera(song_pac) if song_pac.exists() else None
+        except (BscamError, ArcError, PacError) as exc:
+            print(f"warning: {song_pac}: {exc}", file=sys.stderr)
+        if camera_anim is None:
+            print(
+                f"warning: no .bscam camera in {song_pac}, using --eye/--target",
+                file=sys.stderr,
+            )
+        else:
+            state = camera_anim.state(0.0)
+            print(
+                f"camera animation: {camera_anim.version} {camera_anim.fps:.0f} fps, "
+                f"{camera_anim.frame_count:.0f} frames, "
+                f"frame 0 eye={tuple(round(v, 2) for v in state.position)} "
+                f"fov={state.fov_degrees:.1f}"
+            )
+
+    stage_layer = None if camera_anim is not None else render_buffer(
         stage_wire, textures, args.width, args.height, camera=camera
     )
 
@@ -832,7 +856,7 @@ def cmd_live(args: argparse.Namespace) -> int:
                             index_count=mesh.index_count,
                             stride=mesh.stride,
                             positions=[
-                                (p[0] + offset_x, p[1] + offset_y, p[2] + stage_top)
+                                (p[0] + offset_x, p[1] + offset_y, p[2] + floor_top)
                                 for p in mesh.positions
                             ],
                             normals=mesh.normals,
@@ -842,8 +866,26 @@ def cmd_live(args: argparse.Namespace) -> int:
                         entry["bindings"].get(mesh_index),
                     )
                 )
+        if camera_anim is not None:
+            state = camera_anim.state(frame)
+            frame_camera = Camera(
+                position=state.position,
+                target=state.target,
+                fov_degrees=state.fov_degrees,
+            )
+            layer = None
+            layer_wire = stage_wire + wire
+        else:
+            frame_camera = camera
+            layer = stage_layer
+            layer_wire = wire
         pixels, _depth = render_buffer(
-            wire, textures, args.width, args.height, camera=camera, base=stage_layer
+            layer_wire,
+            textures,
+            args.width,
+            args.height,
+            camera=frame_camera,
+            base=layer,
         )
         tiles.append(pixels)
         label = f"frame {frame:g}"
@@ -1063,6 +1105,7 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--out", required=True)
     live.add_argument("--audio", default=None, metavar="WAV")
     live.add_argument("--frames", default=None, metavar="START:END:STEP")
+    live.add_argument("--camera-anim", action="store_true", help="follow the song's .bscam camera")
     live.add_argument("--sheet", default=None, metavar="PNG")
     live.add_argument("--columns", type=int, default=0)
     live.set_defaults(func=cmd_live)

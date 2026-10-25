@@ -184,6 +184,162 @@ def _mip_level(surface: "_Surface", ua, ub, uc, screen_area: float) -> int:
     return max(0, min(int(math.log2(ratio)), limit))
 
 
+def _uv_scale(mesh, uvs, width: int, height: int, samples: int = 256) -> float | None:
+    """Median texels per world unit for a mesh.
+
+    Stage meshes carry a few vertices whose UV is garbage (``|u|`` in the tens
+    of thousands) even though their neighbours are continuous. Deciding the mip
+    from a single triangle's UV span makes those triangles collapse to the 1x1
+    level, painting flat slabs over the stage, so the mesh-wide median is used
+    instead.
+    """
+    if not uvs or not mesh.indices:
+        return None
+    ratios: list[float] = []
+    step = max(1, mesh.triangle_count // samples)
+    for triangle in range(0, mesh.triangle_count, step):
+        a, b, c = mesh.indices[triangle * 3 : triangle * 3 + 3]
+        if max(a, b, c) >= len(uvs):
+            continue
+        for i, j in ((a, b), (b, c), (c, a)):
+            du = (uvs[i][0] - uvs[j][0]) * width
+            dv = (uvs[i][1] - uvs[j][1]) * height
+            if not (math.isfinite(du) and math.isfinite(dv)):
+                continue
+            p, q = mesh.positions[i], mesh.positions[j]
+            world = math.dist(p, q)
+            if world < 1e-6:
+                continue
+            ratio = math.hypot(du, dv) / world
+            if ratio > 0.0:
+                ratios.append(ratio)
+    if not ratios:
+        return None
+    ratios.sort()
+    return ratios[len(ratios) // 2]
+
+
+def _solve4(matrix: list[list[float]], vector: list[float]) -> list[float] | None:
+    """Solve a 4x4 linear system with partial pivoting."""
+    rows = [row[:] + [value] for row, value in zip(matrix, vector)]
+    for column in range(4):
+        pivot = max(range(column, 4), key=lambda r: abs(rows[r][column]))
+        if abs(rows[pivot][column]) < 1e-12:
+            return None
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        scale = rows[column][column]
+        rows[column] = [value / scale for value in rows[column]]
+        for other in range(4):
+            if other == column:
+                continue
+            factor = rows[other][column]
+            if factor:
+                rows[other] = [
+                    value - factor * base
+                    for value, base in zip(rows[other], rows[column])
+                ]
+    return [rows[i][4] for i in range(4)]
+
+
+def _fit_plane(points: list[tuple[float, float, float]], values: list[float]):
+    """Least-squares fit ``a*x + b*y + c*z + d`` and return (coefficients, residual).
+
+    A tiny ridge keeps the normal equations solvable when the mesh is flat
+    along one axis (walls, floors), which would otherwise leave that coefficient
+    undetermined.
+    """
+    normal = [[0.0] * 4 for _ in range(4)]
+    rhs = [0.0] * 4
+    for point, value in zip(points, values):
+        row = (point[0], point[1], point[2], 1.0)
+        for i in range(4):
+            rhs[i] += row[i] * value
+            for j in range(4):
+                normal[i][j] += row[i] * row[j]
+    ridge = 1e-6 * max(1.0, max(normal[i][i] for i in range(4)))
+    for i in range(4):
+        normal[i][i] += ridge
+    coefficients = _solve4(normal, rhs)
+    if coefficients is None:
+        return None, []
+    residuals = [
+        abs(coefficients[0] * p[0] + coefficients[1] * p[1] + coefficients[2] * p[2]
+            + coefficients[3] - value)
+        for p, value in zip(points, values)
+    ]
+    return coefficients, residuals
+
+
+def _repair_uvs(mesh) -> list[tuple[float, float]] | None:
+    """Replace stage UV outliers with a robust planar fit.
+
+    Some stage vertices carry UVs whose magnitude is hundreds of times larger
+    than their neighbours' (the authored mapping is a world-space projection, so
+    the majority of vertices lie on a plane in UV space). Vertices whose UV
+    magnitude is far outside the mesh median are dropped, the plane is fitted to
+    the rest, and only the dropped vertices are rewritten from the fit; meshes
+    whose UVs are already coherent are returned untouched (``None``).
+    """
+    count = len(mesh.uvs)
+    if count < 8 or count != len(mesh.positions):
+        return None
+    if not all(math.isfinite(value) for uv in mesh.uvs for value in uv):
+        return None
+    if max(max(abs(uv[0]), abs(uv[1])) for uv in mesh.uvs) < 32.0:
+        # Character UVs are normalised; only stage meshes need the check.
+        return None
+    points = [(p[0], p[1], p[2]) for p in mesh.positions]
+    columns = ([uv[0] for uv in mesh.uvs], [uv[1] for uv in mesh.uvs])
+    sane = []
+    for axis in (0, 1):
+        ordered = sorted(abs(value) for value in columns[axis])
+        limit = max(16.0, ordered[len(ordered) // 2] * 32.0)
+        sane.append({i for i, value in enumerate(columns[axis]) if abs(value) <= limit})
+    kept = sorted(sane[0] & sane[1])
+    if len(kept) < 8 or len(kept) == count:
+        return None
+    channels = []
+    for axis in (0, 1):
+        coefficients, _residuals = _fit_plane(
+            [points[i] for i in kept], [columns[axis][i] for i in kept]
+        )
+        if coefficients is None:
+            return None
+        channels.append(coefficients)
+    residuals = [
+        max(
+            abs(channels[0][0] * p[0] + channels[0][1] * p[1] + channels[0][2] * p[2]
+                + channels[0][3] - uv[0]),
+            abs(channels[1][0] * p[0] + channels[1][1] * p[1] + channels[1][2] * p[2]
+                + channels[1][3] - uv[1]),
+        )
+        for p, uv in zip(points, mesh.uvs)
+    ]
+    ordered = sorted(residuals[i] for i in kept)
+    limit = max(0.25, ordered[len(ordered) // 2] * 8.0)
+    if not any(residuals[i] > limit for i in range(count)):
+        return None
+    repaired = list(mesh.uvs)
+    for i, point in enumerate(points):
+        if residuals[i] <= limit:
+            continue
+        repaired[i] = (
+            channels[0][0] * point[0] + channels[0][1] * point[1]
+            + channels[0][2] * point[2] + channels[0][3],
+            channels[1][0] * point[0] + channels[1][1] * point[1]
+            + channels[1][2] * point[2] + channels[1][3],
+        )
+    return repaired
+
+
+def _mip_from_world(scale: float, pa, pb, pc, screen_area: float, limit: int) -> int:
+    edge = max(math.dist(pa, pb), math.dist(pb, pc), math.dist(pc, pa))
+    footprint = max(scale * edge, 1e-9)
+    pixels = max(abs(screen_area), 1e-6) ** 0.5
+    ratio = max(footprint / pixels, 1e-9)
+    return max(0, min(int(math.log2(ratio)), limit))
+
+
 def render_buffer(
     wire: list,
     textures: dict[str, BtxTexture],
@@ -280,8 +436,16 @@ def render_buffer(
                             w,
                         )
                     )
-        has_uv = bool(mesh.uvs)
+        uvs = _repair_uvs(mesh) or mesh.uvs
+        has_uv = bool(uvs)
         has_normal = bool(mesh.normals)
+        scale = None
+        limit = 0
+        if canvas is not None:
+            width_px, height_px = canvas.texture.header.width, canvas.texture.header.height
+            limit = max(1, int(math.log2(max(width_px, height_px))))
+            if has_uv:
+                scale = _uv_scale(mesh, uvs, width_px, height_px)
         for triangle in range(mesh.triangle_count):
             a, b, c = mesh.indices[triangle * 3 : triangle * 3 + 3]
             if a >= len(screen) or b >= len(screen) or c >= len(screen):
@@ -302,7 +466,7 @@ def render_buffer(
             if min_px > max_px or min_py > max_py:
                 continue
             if has_uv:
-                ua, ub, uc = mesh.uvs[a], mesh.uvs[b], mesh.uvs[c]
+                ua, ub, uc = uvs[a], uvs[b], uvs[c]
                 uv_ok = all(math.isfinite(c) for uv in (ua, ub, uc) for c in uv)
             else:
                 ua = ub = uc = (0.0, 0.0)
@@ -313,7 +477,17 @@ def render_buffer(
                 na = nb = nc = (0.0, 0.0, 1.0)
             mip = 0
             if canvas is not None and uv_ok:
-                mip = _mip_level(canvas, ua, ub, uc, area)
+                if scale is not None:
+                    mip = _mip_from_world(
+                        scale,
+                        mesh.positions[a],
+                        mesh.positions[b],
+                        mesh.positions[c],
+                        area,
+                        limit,
+                    )
+                else:
+                    mip = _mip_level(canvas, ua, ub, uc, area)
             level = canvas.level(mip) if canvas is not None else None
             inv_area = 1.0 / area
             ia, ib, ic = 1.0 / aw, 1.0 / bw, 1.0 / cw
