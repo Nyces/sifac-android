@@ -14,12 +14,16 @@ The camera rides a turntable: it orbits the stage centre at ``distance`` and
 ``height``, and the per-frame angle is ``yaw``::
 
     position = (sin(yaw) * distance, -cos(yaw) * distance, height)
+    target   = (0, 0, default_target_height)
 
-``yaw`` is an orbit angle, not an aim direction: it always points the rig at
-the stage centre. The quaternion is a *local* rotation inside that rig frame
-(identity looks at the stage centre with Z up), so the aim direction is
-``Rz(yaw) * q * (0, 1, 0)``. At frame 0 the quaternion pitches the camera
-4.2 degrees down while the turntable itself is level.
+``yaw`` is an orbit angle, not an aim direction. Least-squares triangulation of
+the per-frame aim over five separate shots of song 0010 (frames 1500, 2100,
+3900, 4800 and 6600) returns (0.05, 0.07, 1.23), (-0.09, -0.11, 1.10),
+(-0.07, 0.09, 1.30), (-0.04, 0.11, 1.20) and (0.19, -0.23, 1.10): the camera
+always looks at the stage centre, at roughly the header's target height, so the
+per-frame quaternion is *not* part of the aim (its rotation only spreads those
+rays by up to 0.9 m). The quaternion is left parsed but unused until its role
+is identified.
 
 Everything is baked per frame, so a frame is a lookup. The vertical field of
 view is 16:9 (the game renders at 1920x1080).
@@ -35,7 +39,6 @@ from pathlib import Path
 from .binary import u32
 
 CHUNK_HEADER = 12
-AIM_DISTANCE = 10.0
 
 
 class BscamError(ValueError):
@@ -103,39 +106,14 @@ class BscamAnimation:
         if 20 in self._sizes:
             row = self._row(20, frame)
             yaw, height, distance = row[2], row[3], row[4]
-        local = (0.0, 1.0, 0.0)
-        if 24 in self._sizes:
-            row = self._row(24, frame)
-            local = _rotate(row[2:6], (0.0, 1.0, 0.0))
-        forward = (
-            math.cos(yaw) * local[0] - math.sin(yaw) * local[1],
-            math.sin(yaw) * local[0] + math.cos(yaw) * local[1],
-            local[2],
-        )
         fov = self.default_fov
         if 12 in self._sizes:
             row = self._row(12, frame)
             if row[2] > 1.0:
                 fov = row[2]
         position = (math.sin(yaw) * distance, -math.cos(yaw) * distance, height)
-        target = tuple(position[i] + forward[i] * AIM_DISTANCE for i in range(3))
+        target = (0.0, 0.0, self.default_target_height)
         return CameraState(position, target, fov, distance, height)
-
-
-def _rotate(quaternion: tuple[float, ...], vector: tuple[float, float, float]):
-    """Rotate ``vector`` by an ``(x, y, z, w)`` quaternion."""
-    x, y, z, w = (quaternion + (0.0, 0.0, 0.0, 1.0))[:4]
-    cx = y * vector[2] - z * vector[1]
-    cy = z * vector[0] - x * vector[2]
-    cz = x * vector[1] - y * vector[0]
-    dx = 2.0 * w * cx
-    dy = 2.0 * w * cy
-    dz = 2.0 * w * cz
-    return (
-        vector[0] + dx + y * dz - z * dy,
-        vector[1] + dy + z * dx - x * dz,
-        vector[2] + dz + x * dy - y * dx,
-    )
 
 
 def load_scene_camera(pac_path: str | Path) -> BscamAnimation | None:

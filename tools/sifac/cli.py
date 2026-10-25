@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -478,8 +479,6 @@ def _attach_rigid_meshes(
 
 
 def cmd_pose(args: argparse.Namespace) -> int:
-    import math
-
     from .bml import find_bml_in_pac, render_silhouette
     from .skin import Skeleton
 
@@ -737,6 +736,55 @@ def _formation(count: int, spacing: float = 2.2, depth: float = 1.7) -> list[tup
     return spots
 
 
+def _formation_from_btlb(pac: Path, count: int) -> list[tuple[float, float]] | None:
+    """Read the performer floor plan from a song's character timeline.
+
+    Each record carries ``(x, focus height, depth)``. For song 0010 the ``(x,
+    depth)`` plane spans 7.0 x 1.8 m with a minimum spacing of 1.32 m, while
+    either alternative puts two performers 0.14 m apart, so those are the floor
+    axes and the remaining one (about 1.4 m, i.e. chest height) is dropped.
+    Songs whose plan is degenerate fall back to the placeholder formation.
+    """
+    from .btlb import load_timelines
+
+    timelines = load_timelines(pac)
+    records = next(
+        (
+            timeline.chara_records()
+            for name, timeline in timelines.items()
+            if "chara" in name and timeline.chara_records()
+        ),
+        [],
+    )
+    if len(records) < count:
+        print(
+            f"warning: {pac.name} holds {len(records)} performer record(s), need {count}",
+            file=sys.stderr,
+        )
+        return None
+    spots = [(record.position[0], record.position[2]) for record in records[:count]]
+    spacing = min(
+        (
+            math.dist(a, b)
+            for index, a in enumerate(spots)
+            for b in spots[index + 1 :]
+        ),
+        default=0.0,
+    )
+    if spacing < 0.6:
+        print(
+            f"warning: timeline plan puts two performers {spacing:.2f} m apart, "
+            "keeping the placeholder formation",
+            file=sys.stderr,
+        )
+        return None
+    print(
+        f"formation: {count} performer(s) from the character timeline, "
+        f"min spacing {spacing:.2f} m"
+    )
+    return spots
+
+
 def cmd_live(args: argparse.Namespace) -> int:
     from .anim import load_live_motion, sample_pose
     from .bml import Mesh, find_bml_in_pac
@@ -772,6 +820,10 @@ def cmd_live(args: argparse.Namespace) -> int:
     if args.characters:
         packs = packs[: args.characters]
     spots = _formation(len(packs))
+    if args.formation == "btlb":
+        timeline_spots = _formation_from_btlb(live_dir / f"{song}.pac", len(packs))
+        if timeline_spots:
+            spots = timeline_spots
     print(f"song {song}: {len(packs)} character pack(s)")
 
     models = []
@@ -924,6 +976,50 @@ def cmd_live(args: argparse.Namespace) -> int:
             f"  frame {frames[0]:g} at 60 fps = {frames[0] / 60.0:.2f}s, "
             f"track length {info.duration:.2f}s"
         )
+    return 0
+
+
+def cmd_btlb(args: argparse.Namespace) -> int:
+    from .btlb import load_timelines
+
+    timelines = load_timelines(args.pac)
+    if not timelines:
+        print(f"{args.pac}: no .btlb timeline found", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json(
+            {
+                name: {
+                    "channels": timeline.channel_count,
+                    "payload_size": timeline.payload_size,
+                    "performers": [
+                        {
+                            "offset": record.offset,
+                            "end_tick": record.end_tick,
+                            "ids": list(record.ids),
+                            "blend": list(record.blend),
+                            "position": list(record.position),
+                        }
+                        for record in timeline.chara_records()
+                    ],
+                }
+                for name, timeline in timelines.items()
+            }
+        )
+        return 0
+    for name, timeline in timelines.items():
+        records = timeline.chara_records()
+        print(
+            f"{name}: {timeline.channel_count} channel(s), "
+            f"payload={timeline.payload_size} bytes, {len(records)} performer record(s)"
+        )
+        for index, record in enumerate(records):
+            x, y, z = record.position
+            print(
+                f"  [{index}] pos=({x:8.3f},{y:8.3f},{z:8.3f}) "
+                f"end_tick={record.end_tick:6d} ids={record.ids} "
+                f"blend=({record.blend[1]:.3f},{record.blend[2]:.3f},{record.blend[3]:.3f})"
+            )
     return 0
 
 
@@ -1106,9 +1202,20 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--audio", default=None, metavar="WAV")
     live.add_argument("--frames", default=None, metavar="START:END:STEP")
     live.add_argument("--camera-anim", action="store_true", help="follow the song's .bscam camera")
+    live.add_argument(
+        "--formation",
+        choices=("grid", "btlb"),
+        default="grid",
+        help="performer layout: placeholder grid or the song's character timeline",
+    )
     live.add_argument("--sheet", default=None, metavar="PNG")
     live.add_argument("--columns", type=int, default=0)
     live.set_defaults(func=cmd_live)
+
+    btl = sub.add_parser("btlb", help="inspect a song pack's .btlb timelines")
+    btl.add_argument("pac")
+    btl.add_argument("--json", action="store_true")
+    btl.set_defaults(func=cmd_btlb)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")
