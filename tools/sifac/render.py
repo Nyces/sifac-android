@@ -622,6 +622,37 @@ def render_buffer(
     return bytes(pixels), depth
 
 
+def frame_stats(
+    pixels: bytes,
+    width: int,
+    height: int,
+    background: tuple[int, int, int, int] = BACKGROUND,
+) -> tuple[float, float]:
+    """(fraction of pixels that differ from the background, mean channel value).
+
+    Uses numpy when it is installed (a 1080p frame has two million pixels and
+    the pure-Python loop costs seconds); falls back to the loop otherwise.
+    """
+    count = width * height
+    if count <= 0 or len(pixels) < count * 4:
+        return 0.0, 0.0
+    try:
+        import numpy as np
+    except ImportError:
+        wanted = bytes(background[:3])
+        filled = 0
+        total = 0
+        for index in range(0, count * 4, 4):
+            total += pixels[index] + pixels[index + 1] + pixels[index + 2]
+            if pixels[index : index + 3] != wanted:
+                filled += 1
+        return filled / count, total / (count * 3)
+    frame = np.frombuffer(pixels, dtype=np.uint8).reshape(count, 4)
+    wanted = np.asarray(background[:3], dtype=np.uint8)
+    filled = int((frame[:, :3] != wanted).any(axis=1).sum())
+    return filled / count, float(frame[:, :3].mean())
+
+
 def encode_sheet(
     tiles: list[bytes],
     tile_width: int,

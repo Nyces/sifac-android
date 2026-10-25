@@ -823,7 +823,7 @@ def cmd_live(args: argparse.Namespace) -> int:
     from .anim import load_live_motion, sample_pose
     from .bml import Mesh, find_bml_in_pac
     from .livedata import load_live_records, load_stage_records, stage_id_for
-    from .render import BACKGROUND, Camera, encode_sheet, render_buffer
+    from .render import Camera, encode_sheet, frame_stats, render_buffer
     from .skin import Skeleton, place_by_nodes
     from .texture import encode_png, load_texture_archive
 
@@ -1041,17 +1041,7 @@ def cmd_live(args: argparse.Namespace) -> int:
                 camera=frame_camera,
                 base=layer,
             )
-        background = bytes(BACKGROUND[:3])
-        filled = 0
-        total = 0
-        count = args.width * args.height
-        for index in range(0, len(pixels), 4):
-            red, green, blue = pixels[index], pixels[index + 1], pixels[index + 2]
-            total += red + green + blue
-            if pixels[index : index + 3] != background:
-                filled += 1
-        share = filled / count
-        mean = total / (count * 3)
+        share, mean = frame_stats(pixels, args.width, args.height)
         # A live frame is filled by the stage or by a performer; song 0010's
         # opening shot covers 100% of the image, while a camera that misses the
         # stage (song 0050 on st001) covers 1.5%.

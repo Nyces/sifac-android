@@ -105,6 +105,8 @@ class GpuScene:
         self.program["u_texture"].value = 0
         self.program["u_light"].value = (-0.4, -0.85, 0.35)
         self._textures: dict[str, object] = {}
+        self._geometry: dict[int, tuple] = {}
+        self._generation = 0
         self._fallback = self.ctx.texture((1, 1), 4, bytes((180, 180, 180, 255)))
         self._fallback.build_mipmaps()
 
@@ -139,18 +141,20 @@ class GpuScene:
         self._textures[key] = uploaded
         return uploaded
 
-    def _draw(self, mesh, texture, additive: bool) -> None:
+    def _geometry_for(self, mesh, triangles):
+        """VAO+VBO+EBO for a mesh, cached while the same object keeps showing up.
+
+        Stage meshes are built once and reused by every frame, while posed
+        character meshes are new objects each frame; ``render`` drops the
+        entries the current frame did not touch, so nothing accumulates.
+        """
+        entry = self._geometry.get(id(mesh))
+        if entry is not None and entry[0] is mesh:
+            entry[4] = self._generation
+            return entry[1]
+
         count = len(mesh.positions)
-        if count == 0 or not mesh.indices:
-            return
-        indices = np.asarray(mesh.indices, dtype=np.int32)
-        triangles = indices[: (len(indices) // 3) * 3].reshape(-1, 3)
-        triangles = triangles[(triangles >= 0).all(axis=1) & (triangles < count).all(axis=1)]
-        if not len(triangles):
-            return
         positions = np.asarray(mesh.positions, dtype=np.float32)
-        if not np.isfinite(positions).all():
-            return
         if mesh.uvs and len(mesh.uvs) == count:
             repaired = _repair_uvs(mesh)
             uvs = np.asarray(repaired if repaired is not None else mesh.uvs, dtype=np.float32)
@@ -165,25 +169,46 @@ class GpuScene:
         normals = np.nan_to_num(normals, nan=0.0, posinf=0.0, neginf=0.0)
 
         vertex_data = np.hstack((positions, uvs, normals)).astype(np.float32)
-        index_data = triangles.reshape(-1).astype(np.int32)
-
         vbo = self.ctx.buffer(vertex_data.tobytes())
-        ebo = self.ctx.buffer(index_data.tobytes())
+        ebo = self.ctx.buffer(triangles.reshape(-1).astype(np.int32).tobytes())
         vao = self.ctx.vertex_array(
             self.program,
             [(vbo, "3f 2f 3f", "in_position", "in_uv", "in_normal")],
             ebo,
         )
+        self._geometry[id(mesh)] = [mesh, vao, vbo, ebo, self._generation]
+        return vao
+
+    def _draw(self, mesh, texture, additive: bool) -> None:
+        count = len(mesh.positions)
+        if count == 0 or not mesh.indices:
+            return
+        positions = np.asarray(mesh.positions, dtype=np.float32)
+        if not np.isfinite(positions).all():
+            return
+        indices = np.asarray(mesh.indices, dtype=np.int32)
+        triangles = indices[: (len(indices) // 3) * 3].reshape(-1, 3)
+        triangles = triangles[(triangles >= 0).all(axis=1) & (triangles < count).all(axis=1)]
+        if not len(triangles):
+            return
+        vao = self._geometry_for(mesh, triangles)
         self.program["u_additive"].value = 1.0 if additive else 0.0
         texture.use(0)
         vao.render(self._moderngl.TRIANGLES)
-        vao.release()
-        vbo.release()
-        ebo.release()
+
+    def _drop_stale_geometry(self) -> None:
+        for key, entry in list(self._geometry.items()):
+            if entry[4] == self._generation:
+                continue
+            entry[1].release()
+            entry[2].release()
+            entry[3].release()
+            del self._geometry[key]
 
     def render(self, wire, textures, camera) -> bytes:
         """Draw every (mesh, material) pair and return top-down RGBA bytes."""
         ctx = self.ctx
+        self._generation += 1
         self.fbo.use()
         red, green, blue, alpha = self.background
         ctx.clear(red / 255.0, green / 255.0, blue / 255.0, alpha / 255.0, depth=1.0)
@@ -213,6 +238,7 @@ class GpuScene:
             self._draw(mesh, texture, flags[index])
         ctx.depth_mask = True
         ctx.disable(self._moderngl.BLEND)
+        self._drop_stale_geometry()
 
         data = self.fbo.read(components=4)
         rows = np.frombuffer(data, dtype=np.uint8).reshape(self.height, self.width, 4)
