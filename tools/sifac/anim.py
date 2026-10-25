@@ -241,6 +241,48 @@ def find_bma_in_pac(path: str | Path, character: str | None = None) -> BmaAnimat
     raise BmaError(f"no BMA animation in {path}")
 
 
+def sample_pose(
+    animation: "BmaAnimation",
+    node_names: set[str],
+    frame: float,
+) -> dict[str, tuple[float, float, float, float]]:
+    """Sample every rotation track that names a node in the model."""
+    pose: dict[str, tuple[float, float, float, float]] = {}
+    for track in animation.tracks:
+        if track.name not in node_names:
+            continue
+        keys = animation.rotation_keys(track)
+        if keys is None:
+            continue
+        pose[track.name] = keys.sample(frame)
+    return pose
+
+
+def load_live_motion(path: str | Path) -> BmaAnimation:
+    """Load the motion stored in a ``live/<song>/cXX_<song>.pac`` pack.
+
+    Those packs hold a single ``mot`` entry whose payload is a BMAR wrapping one
+    BMA (unlike the character packs, which nest a ``motion.pac`` ARC).
+    """
+    from .arc import ArcArchive
+    from .bmar import BmarArchive
+    from .binary import unwrap_section
+    from .pac import read_pac
+
+    image = read_pac(path)
+    top = ArcArchive(image.data)
+    if not top.entries:
+        raise BmaError(f"no entries in {path}")
+    payload, _ = unwrap_section(top.entry_data(top.entries[0]))
+    if payload.startswith(b"BMAR104\0"):
+        bmar = BmarArchive(payload)
+        for index, entry in enumerate(bmar.entries):
+            if entry.type == "BMA":
+                return BmaAnimation(bmar.entry_data(index))
+        raise BmaError(f"no BMA inside the BMAR of {path}")
+    return BmaAnimation(payload)
+
+
 def load_motion(path: str | Path, name: str) -> BmaAnimation:
     """Load one animation from the character's ``motion.pac`` by entry name."""
     from .arc import ArcArchive

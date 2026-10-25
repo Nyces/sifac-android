@@ -723,6 +723,108 @@ def cmd_stage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _formation(count: int, spacing: float = 2.2, depth: float = 1.7) -> list[tuple[float, float]]:
+    """Lay the idols out in three rows, centred on the stage."""
+    rows = 3
+    columns = max(1, (count + rows - 1) // rows)
+    spots: list[tuple[float, float]] = []
+    for index in range(count):
+        row = index % rows
+        column = index // rows
+        x = (column - (columns - 1) / 2.0) * spacing
+        y = row * depth
+        spots.append((x, y))
+    return spots
+
+
+def cmd_live(args: argparse.Namespace) -> int:
+    from .anim import load_live_motion, sample_pose
+    from .bml import Mesh, find_bml_in_pac
+    from .render import Camera, render_meshes
+    from .skin import Skeleton, place_by_nodes
+    from .texture import load_texture_archive
+
+    live_dir = Path(args.live)
+    song = args.song or live_dir.name
+    root = Path(args.root) if args.root else live_dir.parent.parent
+
+    stage_pac = root / "stage" / f"{args.stage}.pac"
+    stage = find_bml_in_pac(stage_pac)
+    stage_skeleton = Skeleton(stage.nodes())
+    stage_nodes = stage.nodes()
+    stage_draw = {call.mesh_index: call.node_index for call in stage.draw_calls()}
+    stage_meshes = place_by_nodes(
+        stage.meshes(), stage_draw, stage_nodes, stage_skeleton
+    )
+    stage_bindings = stage.mesh_materials()
+    wire: list[tuple[object, object]] = [
+        (mesh, stage_bindings.get(index)) for index, mesh in enumerate(stage_meshes)
+    ]
+    textures = dict(load_texture_archive(stage_pac))
+
+    stage_top = 0.0
+    for mesh in stage_meshes:
+        if "stage_top" in mesh.name.lower() or mesh.name.lower().startswith("mainfloor"):
+            stage_top = max(stage_top, mesh.bounds()[1][2])
+    print(f"stage {args.stage}: {len(stage_meshes)} mesh(es), platform top z={stage_top:.2f}")
+
+    packs = sorted(live_dir.glob(f"c??_{song}.pac"))
+    if args.characters:
+        packs = packs[: args.characters]
+    spots = _formation(len(packs))
+    print(f"song {song}: {len(packs)} character pack(s)")
+
+    for index, pack in enumerate(packs):
+        character_id = pack.name[:3]
+        char_pac = root / "chr" / character_id / f"{character_id}.pac"
+        if not char_pac.exists():
+            print(f"  skip {pack.name}: {char_pac} not found", file=sys.stderr)
+            continue
+        model = find_bml_in_pac(char_pac)
+        skeleton = Skeleton(model.nodes())
+        pose = sample_pose(load_live_motion(pack), set(skeleton.nodes), args.frame)
+        if not pose:
+            print(f"  skip {pack.name}: no matching tracks", file=sys.stderr)
+            continue
+        posed, _, _ = _pose_meshes(model, skeleton, model.meshes(), None, pose, args.influences)
+        posed = _attach_rigid_meshes(posed, model, skeleton, pose)
+        bindings = model.mesh_materials()
+        textures.update(load_texture_archive(char_pac))
+        offset_x, offset_y = spots[index]
+        for mesh_index, mesh in enumerate(posed):
+            material = bindings.get(mesh_index)
+            wire.append(
+                (
+                    Mesh(
+                        name=f"{character_id}/{mesh.name}",
+                        vertex_count=mesh.vertex_count,
+                        index_count=mesh.index_count,
+                        stride=mesh.stride,
+                        positions=[
+                            (p[0] + offset_x, p[1] + offset_y, p[2] + stage_top)
+                            for p in mesh.positions
+                        ],
+                        normals=mesh.normals,
+                        uvs=mesh.uvs,
+                        indices=mesh.indices,
+                    ),
+                    material,
+                )
+            )
+        print(
+            f"  {character_id}: {len(pose)} track(s), "
+            f"{sum(m.vertex_count for m in posed)} vertices at ({offset_x:.1f}, {offset_y:.1f})"
+        )
+
+    eye = tuple(args.eye) if args.eye else (0.0, -9.0, stage_top + 1.6)
+    target = tuple(args.target) if args.target else (0.0, 1.6, stage_top + 0.6)
+    camera = Camera(position=eye, target=target, fov_degrees=args.fov)
+    png = render_meshes(wire, textures, args.width, args.height, camera=camera)
+    Path(args.out).write_bytes(png)
+    print(f"wrote {args.out}")
+    return 0
+
+
 def cmd_hexdump(args: argparse.Namespace) -> int:
     data = Path(args.file).read_bytes()
     for line in hexdump(data, offset=args.offset, length=args.length):
@@ -884,6 +986,22 @@ def build_parser() -> argparse.ArgumentParser:
     stage.add_argument("--out", required=True)
     stage.add_argument("--bounds-only", action="store_true")
     stage.set_defaults(func=cmd_stage)
+
+    live = sub.add_parser("live", help="compose a live stage frame (stage + idols + motion)")
+    live.add_argument("live", help="song folder, e.g. <dump>/live/0010")
+    live.add_argument("--root", default=None, help="dump root (defaults to two levels above the song folder)")
+    live.add_argument("--song", default=None)
+    live.add_argument("--stage", default="st001")
+    live.add_argument("--frame", type=float, default=0.0)
+    live.add_argument("--characters", type=int, default=0)
+    live.add_argument("--influences", type=int, default=2)
+    live.add_argument("--eye", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"))
+    live.add_argument("--target", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"))
+    live.add_argument("--fov", type=float, default=45.0)
+    live.add_argument("--width", type=int, default=480)
+    live.add_argument("--height", type=int, default=270)
+    live.add_argument("--out", required=True)
+    live.set_defaults(func=cmd_live)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")
