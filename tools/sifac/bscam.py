@@ -25,8 +25,16 @@ per-frame quaternion is *not* part of the aim (its rotation only spreads those
 rays by up to 0.9 m). The quaternion is left parsed but unused until its role
 is identified.
 
-Everything is baked per frame, so a frame is a lookup. The vertical field of
-view is 16:9 (the game renders at 1920x1080).
+Everything is baked per frame, so a frame is a lookup. The third table is read
+as a vertical field of view in degrees: song 0010 opens at 30.17 deg, which at
+11 m frames the 7 m wide formation and the 13.6 m LED screen correctly.
+
+That reading has one open counter-example: song 0050 reaches 8.16 deg at a 3 m
+distance, which would frame a 0.4 m patch at the target and render an empty
+stage, while the same table converges on the same (0, 0, 1.3) target as song
+0010. Either the value is a focal length rather than an angle (8 mm on a 16:9
+sensor is a very wide lens), or 0050's staging differs; a RenderDoc capture of
+a live frame would settle both this and the performer placement.
 """
 
 from __future__ import annotations
