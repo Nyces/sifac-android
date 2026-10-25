@@ -20,14 +20,21 @@ Formats confirmed against the retail dump:
 
     0x00  RGBA8, 4 bytes per pixel
     0x0d  BC7,   16 bytes per 4x4 block (1 byte per pixel)
+    0x1b  RGBA16F, 8 bytes per pixel
 
-Format ``0x1b`` (8 bytes per pixel, face-expression textures embedded in the
-model's BMT archive) has not been decoded yet. The stream carries two
-four-byte groups per pixel; the last group's final byte is a binary mask
-(0x0000 / 0x3c00 as half floats) that is shared by every expression of one
-character, so these are 2D face-part overlays rather than the 3D face texture
-(the model's face material uses ``honoka_body_01``). It is reported as
-``UNKNOWN`` rather than guessed.
+The format ids match the engine's enum, whose names are in the eboot rodata at
+0x63FF80: ``R8G8B8A8, R8G8B8, R5G6B5, R5G5B5A1, R4G4B4A4, P8, P4, BC1 ... BC7
+(0x0d), D24S8, D15S1, L8, A8, L4A4, L8A8, YUV, PVRTII_4, PVRTII_2, U16U16,
+F16F16, F32, RGBA_U32U32, A16B16G16R16 (0x1b), ...``. A RenderDoc capture of
+the retail game confirms 0x1b is uploaded as ``VK_FORMAT_R16G16B16A16_SFLOAT``
+(128x64 face-expression texture, 64 KiB, no mips).
+
+Format ``0x1b`` is not a picture despite the name: every face-expression
+texture of one character is 128x64, channel 3 is binary (0x0000 / 0x3c00, i.e.
+0.0 / 1.0 as half floats) and identical across expressions, and channels 0..2
+are zero except in a few bands. The model's face material still samples
+``honoka_body_01``, so the expression textures feed a face shader whose use we
+have not decoded; ``to_rgba`` just clamps the halves to 0..1.
 """
 
 from __future__ import annotations
@@ -44,19 +51,19 @@ HEADER_SIZE = 0x80
 
 FORMAT_RGBA8 = 0x00
 FORMAT_BC7 = 0x0D
-FORMAT_UNKNOWN_1B = 0x1B
+FORMAT_RGBA16F = 0x1B
 
 FORMAT_NAMES = {
     FORMAT_RGBA8: "rgba8",
     FORMAT_BC7: "bc7",
-    FORMAT_UNKNOWN_1B: "unknown-0x1b",
+    FORMAT_RGBA16F: "rgba16f",
 }
 
 # bytes per pixel for the formats we can size
 BYTES_PER_PIXEL = {
     FORMAT_RGBA8: 4,
     FORMAT_BC7: 1,
-    FORMAT_UNKNOWN_1B: 8,
+    FORMAT_RGBA16F: 8,
 }
 
 
@@ -129,6 +136,15 @@ def count_levels(payload_size: int, width: int, height: int, fmt: int) -> int:
     return max(levels, 1)
 
 
+def _half_to_byte(value: float) -> int:
+    """Clamp one half-float channel to 0..255 (NaN and negatives become 0)."""
+    if not value > 0.0:
+        return 0
+    if value >= 1.0:
+        return 255
+    return int(value * 255)
+
+
 class BtxTexture:
     def __init__(self, data: bytes) -> None:
         self.data = data
@@ -143,7 +159,7 @@ class BtxTexture:
         return cls(Path(path).read_bytes())
 
     def _require_supported(self) -> None:
-        if self.header.format not in (FORMAT_RGBA8, FORMAT_BC7):
+        if self.header.format not in (FORMAT_RGBA8, FORMAT_BC7, FORMAT_RGBA16F):
             raise BtxError(
                 f"btx format {self.header.format_name} is not decoded yet"
             )
@@ -169,6 +185,9 @@ class BtxTexture:
         raw = self.level_bytes(level)
         if self.header.format == FORMAT_RGBA8:
             return width, height, raw
+        if self.header.format == FORMAT_RGBA16F:
+            halves = struct.unpack(f"<{width * height * 4}e", raw)
+            return width, height, bytes(_half_to_byte(value) for value in halves)
         from texture2ddecoder import decode_bc7  # optional dependency
 
         bgra = decode_bc7(raw, width, height)
