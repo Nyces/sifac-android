@@ -739,11 +739,13 @@ def _formation(count: int, spacing: float = 2.2, depth: float = 1.7) -> list[tup
 def _formation_from_btlb(pac: Path, count: int) -> list[tuple[float, float]] | None:
     """Read the performer floor plan from a song's character timeline.
 
-    Each record carries ``(x, focus height, depth)``. For song 0010 the ``(x,
-    depth)`` plane spans 7.0 x 1.8 m with a minimum spacing of 1.32 m, while
-    either alternative puts two performers 0.14 m apart, so those are the floor
-    axes and the remaining one (about 1.4 m, i.e. chest height) is dropped.
-    Songs whose plan is degenerate fall back to the placeholder formation.
+    Each record carries ``(x, focus height, depth)``. The ``(x, depth)`` plane
+    is the floor plan: song 0010 spans 7.0 x 1.8 m there while either
+    alternative puts two performers 0.14 m apart, and the remaining axis stays
+    at chest height (about 1.4 m). Coincident performers are real — songs with
+    fewer singers park the rest on one spot (0170 puts two records 0.12 m
+    apart) — so the layout is accepted whenever the timeline holds a record per
+    pack, and only implausible coordinates fall back to the placeholder.
     """
     from .btlb import load_timelines
 
@@ -762,26 +764,24 @@ def _formation_from_btlb(pac: Path, count: int) -> list[tuple[float, float]] | N
             file=sys.stderr,
         )
         return None
-    spots = [(record.position[0], record.position[2]) for record in records[:count]]
-    spacing = min(
-        (
-            math.dist(a, b)
-            for index, a in enumerate(spots)
-            for b in spots[index + 1 :]
-        ),
-        default=0.0,
-    )
-    if spacing < 0.6:
-        print(
-            f"warning: timeline plan puts two performers {spacing:.2f} m apart, "
-            "keeping the placeholder formation",
-            file=sys.stderr,
-        )
-        return None
-    print(
-        f"formation: {count} performer(s) from the character timeline, "
-        f"min spacing {spacing:.2f} m"
-    )
+    spots = []
+    for record in records[:count]:
+        x, _height, depth = record.position
+        if not (math.isfinite(x) and math.isfinite(depth)):
+            print(
+                f"warning: {pac.name} has a non-finite performer position, "
+                "keeping the placeholder formation",
+                file=sys.stderr,
+            )
+            return None
+        if abs(x) > 20.0 or not 0.0 <= depth <= 10.0:
+            print(
+                f"warning: {pac.name} places a performer at ({x:.2f}, {depth:.2f}), "
+                "keeping the placeholder formation",
+                file=sys.stderr,
+            )
+            return None
+        spots.append((x, depth))
     return spots
 
 
@@ -820,10 +820,13 @@ def cmd_live(args: argparse.Namespace) -> int:
     if args.characters:
         packs = packs[: args.characters]
     spots = _formation(len(packs))
+    source = "placeholder grid"
     if args.formation == "btlb":
         timeline_spots = _formation_from_btlb(live_dir / f"{song}.pac", len(packs))
         if timeline_spots:
             spots = timeline_spots
+            source = "character timeline"
+    print(f"formation: {len(spots)} performer(s) from the {source}")
     print(f"song {song}: {len(packs)} character pack(s)")
 
     models = []
@@ -1067,6 +1070,71 @@ def cmd_btlb(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_survey(args: argparse.Namespace) -> int:
+    """Report what each song in a dump can drive, without rendering."""
+    from .bscam import load_scene_camera
+    from .btlb import load_timelines
+
+    root = Path(args.root)
+    live = root / "live"
+    if not live.is_dir():
+        print(f"{live}: no live directory", file=sys.stderr)
+        return 1
+    songs = sorted(entry.name for entry in live.iterdir() if entry.is_dir())
+    print(
+        f"{'song':>6} {'packs':>5} {'performers':>10} {'spacing':>7} "
+        f"{'frames':>6} {'camera':>6} {'audio':>5}  stage*"
+    )
+    counts = {"full": 0, "partial": 0, "none": 0}
+    for song in songs:
+        pac = live / song / f"{song}.pac"
+        if not pac.exists():
+            continue
+        packs = len(list((live / song).glob(f"c??_{song}.pac")))
+        audio = (root / "sound" / "dlc" / f"MUSIC_{song}.awb").exists()
+        try:
+            timelines = load_timelines(pac)
+            camera = load_scene_camera(pac)
+        except Exception as exc:  # noqa: BLE001 - a survey reports, never stops
+            print(f"{song:>6} {packs:5d} error: {exc}", file=sys.stderr)
+            continue
+        chara = next(
+            (timeline for name, timeline in timelines.items() if "chara" in name), None
+        )
+        records = chara.chara_records() if chara else []
+        spots = [(record.position[0], record.position[2]) for record in records]
+        spacing = min(
+            (
+                math.dist(spots[i], spots[j])
+                for i in range(len(spots))
+                for j in range(i + 1, len(spots))
+            ),
+            default=0.0,
+        )
+        frames = int(camera.frame_count) if camera else 0
+        if len(records) >= packs:
+            counts["full"] += 1
+        elif records:
+            counts["partial"] += 1
+        else:
+            counts["none"] += 1
+        stage = f"st{int(song) // 10:03d}"
+        print(
+            f"{song:>6} {packs:5d} {len(records):10d} {spacing:7.2f} "
+            f"{frames:6d} {'yes' if camera else 'no':>6} "
+            f"{'yes' if audio else 'no':>5}  {stage}"
+        )
+    print(
+        f"\n{counts['full']} song(s) with a full performer list, "
+        f"{counts['partial']} partial, {counts['none']} without any"
+    )
+    print(
+        "stage* is a guess: the song folder divided by ten. Nothing in the live "
+        "pack names its stage, so pass --stage to live explicitly."
+    )
+    return 0
+
+
 def cmd_hexdump(args: argparse.Namespace) -> int:
     data = Path(args.file).read_bytes()
     for line in hexdump(data, offset=args.offset, length=args.length):
@@ -1261,6 +1329,12 @@ def build_parser() -> argparse.ArgumentParser:
     btl.add_argument("--limit", type=int, default=6, help="cues printed per performer")
     btl.add_argument("--json", action="store_true")
     btl.set_defaults(func=cmd_btlb)
+
+    survey = sub.add_parser(
+        "survey", help="report what every song in a dump provides (no rendering)"
+    )
+    survey.add_argument("root", help="game root, the folder that holds live/")
+    survey.set_defaults(func=cmd_survey)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")
