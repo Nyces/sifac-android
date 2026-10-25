@@ -36,6 +36,7 @@ meshes without skinning omit the tail block)::
     stride 84   0x00 3 x f32 position
                 0x0c 3 x f32 normal
                 0x18 f32      (attribute 1 .w, saved with the normal)
+                0x1c 4 x u8   bone palette indices (attribute 3)
                 0x40 2 x u16 UV (unorm16), followed by extra UV sets
 
     stride 60   0x00 3 x f32 position
@@ -136,6 +137,8 @@ class Mesh:
     normals: list[tuple[float, float, float]] = field(default_factory=list)
     uvs: list[tuple[float, float]] = field(default_factory=list)
     indices: list[int] = field(default_factory=list)
+    # Four bone palette indices (u8 x 4) stored at 0x1c of stride-84 vertices.
+    bone_indices: list[tuple[int, int, int, int]] = field(default_factory=list)
 
     @property
     def triangle_count(self) -> int:
@@ -313,6 +316,10 @@ class BmlArchive:
             uv_offset = UV_OFFSET_BY_STRIDE.get(stride, 0x40 if stride >= 0x44 else 0x18)
             u_raw, v_raw = struct.unpack_from("<2H", self.data, offset + uv_offset)
             mesh.uvs.append((u_raw / 65535.0, v_raw / 65535.0))
+            if stride == 84:
+                mesh.bone_indices.append(
+                    struct.unpack_from("<4B", self.data, offset + 0x1C)
+                )
         mesh.indices = list(
             struct.unpack_from(f"<{index_count}H", self.data, index_ptr)
         )

@@ -403,16 +403,20 @@ def cmd_pose(args: argparse.Namespace) -> int:
     import math
 
     from .bml import Mesh, find_bml_in_pac, render_silhouette
-    from .skin import Skeleton, auto_weights, deform
+    from .skin import Skeleton, auto_weights, deform, palette_map, weights_from_palette
 
     archive = find_bml_in_pac(args.pac, args.character)
     skeleton = Skeleton(archive.nodes())
+    meshes = archive.meshes()
     biped = [name for name in skeleton.nodes if name.startswith("Bip001_")]
     hair = [name for name in skeleton.nodes if "_bon_" in name]
     head = [
         name for name in skeleton.nodes
         if name in ("Bip001_Head", "Bip001_Neck", "Honoka_head_set")
     ]
+    mapping = palette_map(meshes, skeleton, biped + hair + head) if any(
+        mesh.bone_indices for mesh in meshes
+    ) else {}
     pose: dict[str, tuple[float, float, float]] = {}
     for spec in args.rotate:
         name, _, values = spec.partition("=")
@@ -426,7 +430,7 @@ def cmd_pose(args: argparse.Namespace) -> int:
         pose[name.strip()] = tuple(math.radians(v) for v in parts)  # type: ignore[assignment]
     posed: list[Mesh] = []
     skipped = 0
-    for mesh in archive.meshes():
+    for mesh in meshes:
         lower = mesh.name.lower()
         if "hair" in lower:
             candidates = hair + head
@@ -442,7 +446,11 @@ def cmd_pose(args: argparse.Namespace) -> int:
             posed.append(mesh)
             skipped += 1
             continue
-        weights = auto_weights(mesh, skeleton, args.influences, candidates)
+        weights = (
+            weights_from_palette(mesh, skeleton, mapping, candidates)
+            if mesh.bone_indices and mapping
+            else auto_weights(mesh, skeleton, args.influences, candidates)
+        )
         positions = deform(mesh.positions, skeleton, weights, pose)
         posed.append(
             Mesh(
@@ -458,7 +466,8 @@ def cmd_pose(args: argparse.Namespace) -> int:
         )
     print(
         f"{args.pac}: posed {len(posed)} mesh(es), {sum(m.vertex_count for m in posed)} vertices, "
-        f"{len(pose)} bone(s) rotated, {skipped} local mesh(es) left as-is"
+        f"{len(pose)} bone(s) rotated, {skipped} local mesh(es) left as-is, "
+        f"palette={len(mapping)}"
     )
     if args.obj:
         Path(args.obj).write_text(archive.to_obj_for(posed), encoding="utf-8")

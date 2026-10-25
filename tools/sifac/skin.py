@@ -253,6 +253,71 @@ def auto_weights(
     return result
 
 
+def palette_map(
+    meshes: list[Mesh], skeleton: Skeleton, candidates: list[str] | None = None
+) -> dict[int, str]:
+    """Recover the file's bone palette indices to node names.
+
+    The vertex stream stores four u8 palette indices per vertex, but the file
+    does not say how that palette maps to scene-graph nodes. Grouping vertices
+    by index and matching each group's centroid to the closest bone segment
+    recovers the mapping well enough to drive the rig.
+    """
+    segments = skeleton.segments()
+    if candidates is not None:
+        allowed = set(candidates)
+        segments = [s for s in segments if s.name in allowed]
+    centroids: dict[int, list[float]] = {}
+    counts: dict[int, int] = {}
+    for mesh in meshes:
+        for position, indices in zip(mesh.positions, mesh.bone_indices):
+            for index in indices:
+                if index == 0:
+                    continue
+                acc = centroids.setdefault(index, [0.0, 0.0, 0.0])
+                acc[0] += position[0]
+                acc[1] += position[1]
+                acc[2] += position[2]
+                counts[index] = counts.get(index, 0) + 1
+    mapping: dict[int, str] = {}
+    for index, acc in centroids.items():
+        n = counts[index]
+        centroid = (acc[0] / n, acc[1] / n, acc[2] / n)
+        best = min(segments, key=lambda s: _distance_to_segment(centroid, s))
+        mapping[index] = best.name
+    return mapping
+
+
+def weights_from_palette(
+    mesh: Mesh,
+    skeleton: Skeleton,
+    mapping: dict[int, str],
+    fallback: list[str] | None = None,
+) -> list[tuple[list[int], list[float]]]:
+    """Per-vertex weights using the file's own palette indices as candidates."""
+    segments = {s.name: s for s in skeleton.segments()}
+    result: list[tuple[list[int], list[float]]] = []
+    for position, indices in zip(mesh.positions, mesh.bone_indices):
+        names = []
+        for index in dict.fromkeys(indices):
+            name = mapping.get(index)
+            if name and name in segments and name not in names:
+                names.append(name)
+        if not names:
+            if fallback:
+                names = fallback[:1]
+            else:
+                result.append(([], []))
+                continue
+        scored = sorted(
+            (1.0 / (_distance_to_segment(position, segments[n]) ** 2 + 1e-6), n)
+            for n in names
+        )
+        total = sum(weight for weight, _ in scored) or 1.0
+        result.append(([n for _, n in scored], [w / total for w, _ in scored]))
+    return result
+
+
 def deform(
     positions: list[tuple[float, float, float]],
     skeleton: Skeleton,
