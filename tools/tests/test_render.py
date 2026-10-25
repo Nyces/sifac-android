@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 from sifac.bml import Mesh
 from sifac.render import (
+    BACKGROUND,
+    NEAR_PLANE,
+    Camera,
     _additive,
+    _clip_near,
     _repair_uvs,
     _uv_scale,
     encode_sheet,
@@ -107,6 +111,55 @@ class RenderTests(unittest.TestCase):
         self.assertFalse(_additive(SimpleNamespace(name="wall_mt", texture="s01_walls")))
         self.assertTrue(_additive(SimpleNamespace(name="Glow_Floor_A_mt", texture="x")))
         self.assertTrue(_additive(SimpleNamespace(name="Floor_frame_mt", texture="x")))
+
+    def test_straddling_geometry_is_clipped_not_dropped(self) -> None:
+        mesh = make_quad()
+        # The camera sits over the quad's near half, so two corners fall behind
+        # it: without near clipping both triangles are dropped and the frame
+        # comes out empty.
+        camera = Camera(position=(0.0, -0.4, 0.6), target=(0.0, 5.0, 0.0))
+        pixels, _depth = render_buffer(
+            [(mesh, None)], {}, width=64, height=64, camera=camera
+        )
+        background = bytes(BACKGROUND[:3])
+        filled = sum(
+            1
+            for index in range(0, len(pixels), 4)
+            if pixels[index : index + 3] != background
+        )
+        self.assertGreater(filled, 0)
+
+
+class ClipTests(unittest.TestCase):
+    @staticmethod
+    def vertex(w: float, u: float = 0.0):
+        return (0.0, 0.0, 0.5, w, u, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+
+    def test_inside_triangle_is_untouched(self) -> None:
+        polygon = _clip_near(
+            self.vertex(1.0), self.vertex(2.0), self.vertex(3.0), NEAR_PLANE
+        )
+        self.assertEqual(len(polygon), 3)
+
+    def test_triangle_behind_the_camera_is_dropped(self) -> None:
+        polygon = _clip_near(
+            self.vertex(-1.0), self.vertex(-2.0), self.vertex(-3.0), NEAR_PLANE
+        )
+        self.assertEqual(polygon, [])
+
+    def test_straddling_triangle_becomes_a_quad(self) -> None:
+        polygon = _clip_near(
+            self.vertex(1.0, 0.0), self.vertex(-1.0, 1.0), self.vertex(2.0, 2.0),
+            NEAR_PLANE,
+        )
+        self.assertEqual(len(polygon), 4)
+        on_plane = [v for v in polygon if abs(v[3] - NEAR_PLANE) < 1e-9]
+        self.assertEqual(len(on_plane), 2)
+        # The two cut points interpolate uv with their own edge parameters.
+        self.assertAlmostEqual(on_plane[0][4], 0.475, places=6)
+        self.assertAlmostEqual(on_plane[1][4], 1.35, places=6)
+        for vertex in on_plane:
+            self.assertAlmostEqual(vertex[8], 1.0, places=6)
 
 
 if __name__ == "__main__":

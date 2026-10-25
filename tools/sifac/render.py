@@ -20,8 +20,32 @@ from dataclasses import dataclass
 from .texture import BtxTexture, encode_png
 
 BACKGROUND = (16, 18, 24, 255)
+NEAR_PLANE = 0.05
 ADDITIVE_GAIN = 0.35
 ADDITIVE_NAMES = ("lightbar", "floor_frame", "yuka_led", "mon_dotmask")
+
+
+def _clip_near(v0, v1, v2, near: float):
+    """Clip a triangle against ``w >= near`` in clip space.
+
+    Every component of a vertex is linear in its world position, so one
+    parameter per edge interpolates position, uv, normal and world together.
+    """
+    polygon = []
+    vertices = (v0, v1, v2)
+    for index in range(3):
+        current = vertices[index]
+        following = vertices[(index + 1) % 3]
+        inside = current[3] >= near
+        if inside:
+            polygon.append(current)
+        if inside != (following[3] >= near):
+            span = following[3] - current[3]
+            if span == 0.0:
+                continue
+            t = (near - current[3]) / span
+            polygon.append(tuple(a + (b - a) * t for a, b in zip(current, following)))
+    return polygon
 
 
 @dataclass(frozen=True)
@@ -372,6 +396,10 @@ def render_buffer(
 ) -> tuple[bytes, list[float]]:
     """Rasterise (mesh, material) pairs into an RGBA buffer plus a depth buffer.
 
+    Triangles are clipped against the near plane in homogeneous space, so a
+    floor or wall that crosses the camera still draws its visible part instead
+    of being dropped whole (or smearing a huge polygon over the frame).
+
     Passing ``base`` reuses a previously rendered layer (the static stage), which
     keeps per-frame live renders cheap: only the characters are rasterised.
     """
@@ -397,6 +425,114 @@ def render_buffer(
 
     light = _normalize((-0.4, -0.85, 0.35))
 
+    def rasterize(v0, v1, v2, canvas, uv_scale, mip_limit, additive):
+        """Fill one clipped triangle; vertices carry clip, uv, normal, world."""
+        aw, bw, cw = v0[3], v1[3], v2[3]
+        if aw <= 0.0 or bw <= 0.0 or cw <= 0.0:
+            return
+        ax = (v0[0] / aw * 0.5 + 0.5) * width
+        ay = (0.5 - v0[1] / aw * 0.5) * height
+        az = v0[2] / aw
+        bx = (v1[0] / bw * 0.5 + 0.5) * width
+        by = (0.5 - v1[1] / bw * 0.5) * height
+        bz = v1[2] / bw
+        cx = (v2[0] / cw * 0.5 + 0.5) * width
+        cy = (0.5 - v2[1] / cw * 0.5) * height
+        cz = v2[2] / cw
+        area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        if abs(area) < 1e-9:
+            return
+        min_px = max(0, int(min(ax, bx, cx)))
+        max_px = min(width - 1, int(max(ax, bx, cx)) + 1)
+        min_py = max(0, int(min(ay, by, cy)))
+        max_py = min(height - 1, int(max(ay, by, cy)) + 1)
+        if min_px > max_px or min_py > max_py:
+            return
+        ua = (v0[4], v0[5])
+        ub = (v1[4], v1[5])
+        uc = (v2[4], v2[5])
+        uv_ok = all(math.isfinite(value) for pair in (ua, ub, uc) for value in pair)
+        na = (v0[6], v0[7], v0[8])
+        nb = (v1[6], v1[7], v1[8])
+        nc = (v2[6], v2[7], v2[8])
+        mip = 0
+        if canvas is not None and uv_ok:
+            if uv_scale is not None:
+                mip = _mip_from_world(
+                    uv_scale,
+                    (v0[9], v0[10], v0[11]),
+                    (v1[9], v1[10], v1[11]),
+                    (v2[9], v2[10], v2[11]),
+                    area,
+                    mip_limit,
+                )
+            else:
+                mip = _mip_level(canvas, ua, ub, uc, area)
+        level = canvas.level(mip) if canvas is not None else None
+        inv_area = 1.0 / area
+        ia, ib, ic = 1.0 / aw, 1.0 / bw, 1.0 / cw
+        for py in range(min_py, max_py + 1):
+            fy = py + 0.5
+            for px in range(min_px, max_px + 1):
+                fx = px + 0.5
+                w0 = ((bx - ax) * (fy - ay) - (by - ay) * (fx - ax)) * inv_area
+                w1 = ((cx - bx) * (fy - by) - (cy - by) * (fx - bx)) * inv_area
+                w2 = 1.0 - w0 - w1
+                if w0 < 0.0 or w1 < 0.0 or w2 < 0.0:
+                    continue
+                inv_w = w0 * ia + w1 * ib + w2 * ic
+                if inv_w <= 0.0:
+                    continue
+                index = py * width + px
+                z = (w0 * az * ia + w1 * bz * ib + w2 * cz * ic) / inv_w
+                if z >= depth[index]:
+                    continue
+                if level is None:
+                    color = (180, 180, 180, 255)
+                else:
+                    tw, th, data = level
+                    u = (w0 * ua[0] * ia + w1 * ub[0] * ib + w2 * uc[0] * ic) / inv_w
+                    v = (w0 * ua[1] * ia + w1 * ub[1] * ib + w2 * uc[1] * ic) / inv_w
+                    if not (math.isfinite(u) and math.isfinite(v)):
+                        if additive:
+                            continue
+                        color = (180, 180, 180, 255)
+                        depth[index] = z
+                        pixels[index * 4 : index * 4 + 4] = bytes(color)
+                        continue
+                    tx = int(u * tw) % tw
+                    ty = int((1.0 - v) * th) % th
+                    offset = (ty * tw + tx) * 4
+                    color = tuple(data[offset : offset + 4])
+                nx = w0 * na[0] + w1 * nb[0] + w2 * nc[0]
+                ny = w0 * na[1] + w1 * nb[1] + w2 * nc[1]
+                nz = w0 * na[2] + w1 * nb[2] + w2 * nc[2]
+                normal_length = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+                lambert = abs((nx * light[0] + ny * light[1] + nz * light[2]) / normal_length)
+                if not math.isfinite(lambert):
+                    lambert = 1.0
+                shade = 0.72 + 0.28 * min(1.0, lambert)
+                offset = index * 4
+                if additive:
+                    gain = shade * ADDITIVE_GAIN
+                    pixels[offset] = min(255, pixels[offset] + int(color[0] * gain))
+                    pixels[offset + 1] = min(
+                        255, pixels[offset + 1] + int(color[1] * gain)
+                    )
+                    pixels[offset + 2] = min(
+                        255, pixels[offset + 2] + int(color[2] * gain)
+                    )
+                    continue
+                depth[index] = z
+                pixels[offset : offset + 4] = bytes(
+                    (
+                        min(255, int(color[0] * shade)),
+                        min(255, int(color[1] * shade)),
+                        min(255, int(color[2] * shade)),
+                        255,
+                    )
+                )
+
     if camera is None:
         if meshes:
             min_x, max_x, min_z, max_z = _screen_bounds(meshes)
@@ -413,8 +549,20 @@ def render_buffer(
     for (mesh, canvas), additive in zip(items, flags):
         if not mesh.indices:
             continue
+        uvs = _repair_uvs(mesh) or mesh.uvs
+        has_uv = bool(uvs)
+        has_normal = bool(mesh.normals)
+        uv_scale = None
+        limit = 0
+        if canvas is not None:
+            tex_width = canvas.texture.header.width
+            tex_height = canvas.texture.header.height
+            limit = max(1, int(math.log2(max(tex_width, tex_height))))
+            if has_uv:
+                uv_scale = _uv_scale(mesh, uvs, tex_width, tex_height)
+
         if camera is None:
-            screen = [
+            source = [
                 (
                     (p[0] - min_x) * scale + ortho_margin,
                     height - 1 - ((p[2] - min_z) * scale + ortho_margin),
@@ -425,159 +573,52 @@ def render_buffer(
             ]
         else:
             view_projection = camera.matrices(width / max(height, 1))
-            screen = []
-            for p in mesh.positions:
-                x = (
+            source = [
+                (
                     view_projection[0][0] * p[0]
                     + view_projection[0][1] * p[1]
                     + view_projection[0][2] * p[2]
-                    + view_projection[0][3]
-                )
-                y = (
+                    + view_projection[0][3],
                     view_projection[1][0] * p[0]
                     + view_projection[1][1] * p[1]
                     + view_projection[1][2] * p[2]
-                    + view_projection[1][3]
-                )
-                z = (
+                    + view_projection[1][3],
                     view_projection[2][0] * p[0]
                     + view_projection[2][1] * p[1]
                     + view_projection[2][2] * p[2]
-                    + view_projection[2][3]
-                )
-                w = (
+                    + view_projection[2][3],
                     view_projection[3][0] * p[0]
                     + view_projection[3][1] * p[1]
                     + view_projection[3][2] * p[2]
-                    + view_projection[3][3]
+                    + view_projection[3][3],
                 )
-                if w <= 1e-6:
-                    screen.append(None)
-                else:
-                    screen.append(
-                        (
-                            (x / w * 0.5 + 0.5) * width,
-                            (0.5 - y / w * 0.5) * height,
-                            z / w,
-                            w,
-                        )
-                    )
-        uvs = _repair_uvs(mesh) or mesh.uvs
-        has_uv = bool(uvs)
-        has_normal = bool(mesh.normals)
-        scale = None
-        limit = 0
-        if canvas is not None:
-            width_px, height_px = canvas.texture.header.width, canvas.texture.header.height
-            limit = max(1, int(math.log2(max(width_px, height_px))))
+                for p in mesh.positions
+            ]
+
+        # One flat vertex per mesh vertex: clip position, uv, normal, world.
+        vertices = []
+        for index, clip in enumerate(source):
             if has_uv:
-                scale = _uv_scale(mesh, uvs, width_px, height_px)
+                u, v = uvs[index]
+            else:
+                u = v = 0.0
+            if has_normal:
+                normal = mesh.normals[index]
+            else:
+                normal = (0.0, 0.0, 1.0)
+            world = mesh.positions[index]
+            vertices.append((*clip, u, v, *normal, *world))
+
         for triangle in range(mesh.triangle_count):
             a, b, c = mesh.indices[triangle * 3 : triangle * 3 + 3]
-            if a >= len(screen) or b >= len(screen) or c >= len(screen):
+            if a >= len(vertices) or b >= len(vertices) or c >= len(vertices):
                 continue
-            sa, sb, sc = screen[a], screen[b], screen[c]
-            if sa is None or sb is None or sc is None:
-                continue
-            ax, ay, az, aw = sa
-            bx, by, bz, bw = sb
-            cx, cy, cz, cw = sc
-            area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
-            if abs(area) < 1e-9:
-                continue
-            min_px = max(0, int(min(ax, bx, cx)))
-            max_px = min(width - 1, int(max(ax, bx, cx)) + 1)
-            min_py = max(0, int(min(ay, by, cy)))
-            max_py = min(height - 1, int(max(ay, by, cy)) + 1)
-            if min_px > max_px or min_py > max_py:
-                continue
-            if has_uv:
-                ua, ub, uc = uvs[a], uvs[b], uvs[c]
-                uv_ok = all(math.isfinite(c) for uv in (ua, ub, uc) for c in uv)
-            else:
-                ua = ub = uc = (0.0, 0.0)
-                uv_ok = False
-            if has_normal:
-                na, nb, nc = mesh.normals[a], mesh.normals[b], mesh.normals[c]
-            else:
-                na = nb = nc = (0.0, 0.0, 1.0)
-            mip = 0
-            if canvas is not None and uv_ok:
-                if scale is not None:
-                    mip = _mip_from_world(
-                        scale,
-                        mesh.positions[a],
-                        mesh.positions[b],
-                        mesh.positions[c],
-                        area,
-                        limit,
-                    )
-                else:
-                    mip = _mip_level(canvas, ua, ub, uc, area)
-            level = canvas.level(mip) if canvas is not None else None
-            inv_area = 1.0 / area
-            ia, ib, ic = 1.0 / aw, 1.0 / bw, 1.0 / cw
-            for py in range(min_py, max_py + 1):
-                fy = py + 0.5
-                for px in range(min_px, max_px + 1):
-                    fx = px + 0.5
-                    w0 = ((bx - ax) * (fy - ay) - (by - ay) * (fx - ax)) * inv_area
-                    w1 = ((cx - bx) * (fy - by) - (cy - by) * (fx - bx)) * inv_area
-                    w2 = 1.0 - w0 - w1
-                    if w0 < 0.0 or w1 < 0.0 or w2 < 0.0:
-                        continue
-                    inv_w = w0 * ia + w1 * ib + w2 * ic
-                    if inv_w <= 0.0:
-                        continue
-                    index = py * width + px
-                    z = (w0 * az * ia + w1 * bz * ib + w2 * cz * ic) / inv_w
-                    if z >= depth[index]:
-                        continue
-                    if level is None:
-                        color = (180, 180, 180, 255)
-                    else:
-                        tw, th, data = level
-                        u = (w0 * ua[0] * ia + w1 * ub[0] * ib + w2 * uc[0] * ic) / inv_w
-                        v = (w0 * ua[1] * ia + w1 * ub[1] * ib + w2 * uc[1] * ic) / inv_w
-                        if not (math.isfinite(u) and math.isfinite(v)):
-                            if additive:
-                                continue
-                            color = (180, 180, 180, 255)
-                            depth[index] = z
-                            pixels[index * 4 : index * 4 + 4] = bytes(color)
-                            continue
-                        tx = int(u * tw) % tw
-                        ty = int((1.0 - v) * th) % th
-                        offset = (ty * tw + tx) * 4
-                        color = tuple(data[offset : offset + 4])
-                    nx = w0 * na[0] + w1 * nb[0] + w2 * nc[0]
-                    ny = w0 * na[1] + w1 * nb[1] + w2 * nc[1]
-                    nz = w0 * na[2] + w1 * nb[2] + w2 * nc[2]
-                    normal_length = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
-                    lambert = abs((nx * light[0] + ny * light[1] + nz * light[2]) / normal_length)
-                    if not math.isfinite(lambert):
-                        lambert = 1.0
-                    shade = 0.72 + 0.28 * min(1.0, lambert)
-                    offset = index * 4
-                    if additive:
-                        gain = shade * ADDITIVE_GAIN
-                        pixels[offset] = min(255, pixels[offset] + int(color[0] * gain))
-                        pixels[offset + 1] = min(
-                            255, pixels[offset + 1] + int(color[1] * gain)
-                        )
-                        pixels[offset + 2] = min(
-                            255, pixels[offset + 2] + int(color[2] * gain)
-                        )
-                        continue
-                    depth[index] = z
-                    pixels[offset : offset + 4] = bytes(
-                        (
-                            min(255, int(color[0] * shade)),
-                            min(255, int(color[1] * shade)),
-                            min(255, int(color[2] * shade)),
-                            255,
-                        )
-                    )
+            polygon = _clip_near(vertices[a], vertices[b], vertices[c], NEAR_PLANE)
+            for fan in range(1, len(polygon) - 1):
+                rasterize(
+                    polygon[0], polygon[fan], polygon[fan + 1],
+                    canvas, uv_scale, limit, additive,
+                )
     return bytes(pixels), depth
 
 
