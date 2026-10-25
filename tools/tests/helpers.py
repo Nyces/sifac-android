@@ -5,6 +5,7 @@ from __future__ import annotations
 import struct
 
 from sifac.binary import align_up
+from sifac.blbn import salted_hash
 
 
 def build_arc(entries: list[tuple[str, str, bytes]], name: str = "test.pac") -> bytes:
@@ -103,6 +104,53 @@ def build_awb(entries: list[tuple[int, bytes]], magic: bytes = b"HCA\0") -> byte
         struct.pack_into("<I", result, 0x10 + count * 2 + index * 4, offsets[index])
     result[data_start:] = payloads
     return bytes(result)
+
+
+def build_blbn(
+    symbols: dict[str, bytes], strings: list[str] = ()
+) -> tuple[bytes, dict[str, int]]:
+    """Build a BLBN container (see ``sifac.blbn``).
+
+    Layout: a 0x20-byte section header, the ``BLBN`` root block (size 0), one
+    0x24-byte ``SYM\\0`` block per symbol, a zero-magic data block with the name
+    pool and the symbol payloads, then a zero terminator block.
+    Returns the blob and the base-relative offset of each symbol payload and
+    each extra string.
+    """
+    header = 12
+    symbol_blocks = len(symbols) * 0x24
+    data_payload = header + symbol_blocks + header
+
+    pool = bytearray()
+    name_offsets: dict[str, int] = {}
+    for name in symbols:
+        name_offsets[name] = data_payload + len(pool)
+        pool += name.encode("ascii") + b"\0"
+    string_offsets: dict[str, int] = {}
+    for text in strings:
+        string_offsets[text] = data_payload + len(pool)
+        pool += text.encode("utf-8") + b"\0"
+    data_offsets: dict[str, int] = {}
+    for name, blob in symbols.items():
+        data_offsets[name] = data_payload + len(pool)
+        pool += blob
+        pool += b"\0" * ((4 - len(pool) % 4) % 4)
+
+    chain = bytearray()
+    for name, blob in symbols.items():
+        chain += b"SYM\0" + struct.pack("<I", 24) + b"\0\0\x04\0"
+        chain += struct.pack(
+            "<QQII", data_offsets[name], name_offsets[name], salted_hash(name), len(blob)
+        )
+    chain += b"\0\0\0\0" + struct.pack("<I", len(pool)) + b"\0\0\x04\0"
+    chain += pool
+    chain += b"\0" * 12
+
+    root = b"BLBN" + struct.pack("<I", 0) + b"\0\0\x04\0"
+    blob = b"\0" * 0x20 + root + bytes(chain)
+    offsets = dict(data_offsets)
+    offsets.update(string_offsets)
+    return blob, offsets
 
 
 def build_btx(name: str, width: int, height: int, fmt: int, payload: bytes) -> bytes:

@@ -788,6 +788,7 @@ def _formation_from_btlb(pac: Path, count: int) -> list[tuple[float, float]] | N
 def cmd_live(args: argparse.Namespace) -> int:
     from .anim import load_live_motion, sample_pose
     from .bml import Mesh, find_bml_in_pac
+    from .livedata import load_live_records, load_stage_records, stage_id_for
     from .render import BACKGROUND, Camera, encode_sheet, render_buffer
     from .skin import Skeleton, place_by_nodes
     from .texture import encode_png, load_texture_archive
@@ -796,7 +797,34 @@ def cmd_live(args: argparse.Namespace) -> int:
     song = args.song or live_dir.name
     root = Path(args.root) if args.root else live_dir.parent.parent
 
-    stage_pac = root / "stage" / f"{args.stage}.pac"
+    stage_code = args.stage
+    stage_name = ""
+    if stage_code is None:
+        common = root / "common" / "common.pac"
+        try:
+            stage_id = stage_id_for(load_live_records(common), int(song), args.slot)
+        except (OSError, KeyError, ValueError, ArcError, PacError) as exc:
+            print(
+                f"error: cannot read the live table of {common} ({exc}); pass --stage",
+                file=sys.stderr,
+            )
+            return 1
+        if stage_id is None:
+            print(
+                f"error: song {song} has no live record for slot {args.slot}; "
+                "pass --stage",
+                file=sys.stderr,
+            )
+            return 1
+        stage_code = f"st{stage_id:03d}"
+        try:
+            stage_record = load_stage_records(common).get(stage_id)
+        except (OSError, KeyError, ValueError, ArcError, PacError):
+            stage_record = None
+        if stage_record is not None:
+            stage_name = stage_record.name()
+
+    stage_pac = root / "stage" / f"{stage_code}.pac"
     stage = find_bml_in_pac(stage_pac)
     stage_skeleton = Skeleton(stage.nodes())
     stage_nodes = stage.nodes()
@@ -814,7 +842,8 @@ def cmd_live(args: argparse.Namespace) -> int:
     for mesh in stage_meshes:
         if "mainfloor" in mesh.name.lower():
             floor_top = max(floor_top, mesh.bounds()[1][2])
-    print(f"stage {args.stage}: {len(stage_meshes)} mesh(es), dance floor z={floor_top:.2f}")
+    label = f"{stage_code} ({stage_name})" if stage_name else stage_code
+    print(f"stage {label}: {len(stage_meshes)} mesh(es), dance floor z={floor_top:.2f}")
 
     packs = sorted(live_dir.glob(f"c??_{song}.pac"))
     if args.characters:
@@ -961,8 +990,8 @@ def cmd_live(args: argparse.Namespace) -> int:
             print(
                 f"warning: frame {frame:g} covers {share:.1%} of the image at a mean "
                 f"luminance of {mean:.0f} (eye={eye}, "
-                f"fov={frame_camera.fov_degrees:.1f}, stage={args.stage}); the camera "
-                "may sit outside the stage, or the stage may not be the one this "
+                f"fov={frame_camera.fov_degrees:.1f}, stage={stage_code}); the camera "
+                "may sit outside the stage, or --stage may not be the one this "
                 "song uses",
                 file=sys.stderr,
             )
@@ -1074,16 +1103,24 @@ def cmd_survey(args: argparse.Namespace) -> int:
     """Report what each song in a dump can drive, without rendering."""
     from .bscam import load_scene_camera
     from .btlb import load_timelines
+    from .livedata import load_live_records, load_stage_records, stage_id_for
 
     root = Path(args.root)
     live = root / "live"
     if not live.is_dir():
         print(f"{live}: no live directory", file=sys.stderr)
         return 1
+    common = root / "common" / "common.pac"
+    try:
+        live_records = load_live_records(common)
+        stage_records = load_stage_records(common)
+    except (OSError, KeyError, ValueError, ArcError, PacError) as exc:
+        print(f"warning: cannot read the live/stage tables ({exc})", file=sys.stderr)
+        live_records, stage_records = [], {}
     songs = sorted(entry.name for entry in live.iterdir() if entry.is_dir())
     print(
         f"{'song':>6} {'packs':>5} {'performers':>10} {'spacing':>7} "
-        f"{'frames':>6} {'camera':>6} {'audio':>5}  stage*"
+        f"{'frames':>6} {'camera':>6} {'audio':>5}  stage (slot 0)"
     )
     counts = {"full": 0, "partial": 0, "none": 0}
     for song in songs:
@@ -1118,7 +1155,13 @@ def cmd_survey(args: argparse.Namespace) -> int:
             counts["partial"] += 1
         else:
             counts["none"] += 1
-        stage = f"st{int(song) // 10:03d}"
+        stage_id = stage_id_for(live_records, int(song), 0)
+        if stage_id is None:
+            stage = "?"
+        else:
+            record = stage_records.get(stage_id)
+            name = record.name() if record else ""
+            stage = f"st{stage_id:03d} {name}".rstrip()
         print(
             f"{song:>6} {packs:5d} {len(records):10d} {spacing:7.2f} "
             f"{frames:6d} {'yes' if camera else 'no':>6} "
@@ -1129,8 +1172,8 @@ def cmd_survey(args: argparse.Namespace) -> int:
         f"{counts['partial']} partial, {counts['none']} without any"
     )
     print(
-        "stage* is a guess: the song folder divided by ten. Nothing in the live "
-        "pack names its stage, so pass --stage to live explicitly."
+        "stage is the slot-0 stage id from live_datas.bin (s_live_datas) joined "
+        "with stage_datas.bin; pass --stage/--slot to live to override it."
     )
     return 0
 
@@ -1301,7 +1344,17 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("live", help="song folder, e.g. <dump>/live/0010")
     live.add_argument("--root", default=None, help="dump root (defaults to two levels above the song folder)")
     live.add_argument("--song", default=None)
-    live.add_argument("--stage", default="st001")
+    live.add_argument(
+        "--stage",
+        default=None,
+        help="stage package, e.g. st002 (default: the song's slot stage from live_datas.bin)",
+    )
+    live.add_argument(
+        "--slot",
+        type=int,
+        default=0,
+        help="song-select slot 0..8 (EASY..ADVENTURE) whose stage to use",
+    )
     live.add_argument("--frame", type=float, default=0.0)
     live.add_argument("--characters", type=int, default=0)
     live.add_argument("--influences", type=int, default=2)
