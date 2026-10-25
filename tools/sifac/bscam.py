@@ -4,10 +4,10 @@ The file is a chunk chain::
 
     BSCM   header: version "101", f32 fps (60), f32 frame count (9060),
            defaults for height (1.2875), distance (11.048), target height
-           (1.4985) and field of view (30.17 deg)
+           (1.4985) and focal length (30.17 mm)
     DATA   20 bytes per frame: orbit yaw (+8), height (+12), distance (+16)
     DATA   24 bytes per frame: local rotation quaternion (+8, x/y/z/w)
-    DATA   12 bytes per frame: fov in degrees (+8)
+    DATA   12 bytes per frame: focal length in mm (+8)
     POF0   index block
 
 The camera rides a turntable: it orbits the stage centre at ``distance`` and
@@ -25,16 +25,13 @@ per-frame quaternion is *not* part of the aim (its rotation only spreads those
 rays by up to 0.9 m). The quaternion is left parsed but unused until its role
 is identified.
 
-Everything is baked per frame, so a frame is a lookup. The third table is read
-as a vertical field of view in degrees: song 0010 opens at 30.17 deg, which at
-11 m frames the 7 m wide formation and the 13.6 m LED screen correctly.
-
-That reading has one open counter-example: song 0050 reaches 8.16 deg at a 3 m
-distance, which would frame a 0.4 m patch at the target and render an empty
-stage, while the same table converges on the same (0, 0, 1.3) target as song
-0010. Either the value is a focal length rather than an angle (8 mm on a 16:9
-sensor is a very wide lens), or 0050's staging differs; a RenderDoc capture of
-a live frame would settle both this and the performer placement.
+Everything is baked per frame, so a frame is a lookup. The third table holds a
+**focal length in millimetres**, not an angle: read as degrees, song 0010's close
+shots frame 0.4 m of empty floor and song 0050's 8.16 frame nothing at all. Read
+as a 36 mm-wide sensor lens, 30.17 gives a 37 deg vertical field of view for the
+opening wide shot and 8.16 gives a 103 deg wide-angle close-up, which is the
+look the arcade game uses. Across song 0010's 229 close shots (<5 m) this keeps
+a performer inside the frame 86% of the time against 59% for the degree reading.
 """
 
 from __future__ import annotations
@@ -47,6 +44,8 @@ from pathlib import Path
 from .binary import u32
 
 CHUNK_HEADER = 12
+# The game renders at 1920x1080, so a 36 mm wide sensor is 20.25 mm tall.
+SENSOR_HALF_HEIGHT = 10.125
 
 
 class BscamError(ValueError):
@@ -77,8 +76,7 @@ class BscamAnimation:
             self.default_distance,
             self.default_target_height,
         ) = struct.unpack_from("<3f", data, payload + 0x20)
-        self.default_fov = struct.unpack_from("<f", data, payload + 0x40)[0]
-        self.fov = self.default_fov
+        self.default_lens = struct.unpack_from("<f", data, payload + 0x40)[0]
         self._frames: dict[int, int] = {}
         self._sizes: dict[int, int] = {}
         start = offset + CHUNK_HEADER + u32(data, offset + 4)
@@ -114,14 +112,21 @@ class BscamAnimation:
         if 20 in self._sizes:
             row = self._row(20, frame)
             yaw, height, distance = row[2], row[3], row[4]
-        fov = self.default_fov
+        lens = self.default_lens
         if 12 in self._sizes:
             row = self._row(12, frame)
             if row[2] > 1.0:
-                fov = row[2]
+                lens = row[2]
         position = (math.sin(yaw) * distance, -math.cos(yaw) * distance, height)
         target = (0.0, 0.0, self.default_target_height)
-        return CameraState(position, target, fov, distance, height)
+        return CameraState(position, target, lens_to_fov(lens), distance, height)
+
+
+def lens_to_fov(lens_mm: float) -> float:
+    """Vertical field of view for a focal length on the game's 16:9 sensor."""
+    if lens_mm <= 0.5:
+        return 90.0
+    return math.degrees(2.0 * math.atan(SENSOR_HALF_HEIGHT / lens_mm))
 
 
 def load_scene_camera(pac_path: str | Path) -> BscamAnimation | None:
