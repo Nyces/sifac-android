@@ -40,8 +40,12 @@ meshes without skinning omit the tail block)::
                 0x40 2 x u16 UV (unorm16), followed by extra UV sets
 
     stride 60   0x00 3 x f32 position
-                0x0c 3 x f32 normal
-                0x18 2 x u16 UV (unorm16)
+                0x0c 3 x f16 normal (RenderDoc event 90, face pass)
+                0x18 2 x f16 UV
+
+    stride 44   0x00 3 x f32 position
+                0x0c 3 x f16 normal (RenderDoc event 608, eye pass)
+                0x18 2 x f16 UV
 
 Vertex attributes as actually bound on the PS4 GPU (confirmed with a RenderDoc
 capture of the retail game, draw of ``Honoka_hair``)::
@@ -79,9 +83,6 @@ MESH_HEADER_FIELDS = {
     "counts": 0x18,
 }
 TOPOLOGY_TRIANGLES = 2
-# Offset of the first UV set, keyed by vertex stride. Meshes with skinning use
-# a longer vertex and keep UVs further in.
-UV_OFFSET_BY_STRIDE = {60: 0x18, 84: 0x40}
 
 
 class BmlError(ValueError):
@@ -310,16 +311,23 @@ class BmlArchive:
         )
         for i in range(vertex_count):
             offset = vertex_ptr + i * stride
-            x, y, z, nx, ny, nz = struct.unpack_from("<6f", self.data, offset)
+            x, y, z = struct.unpack_from("<3f", self.data, offset)
             mesh.positions.append((x, y, z))
-            mesh.normals.append((nx, ny, nz))
-            uv_offset = UV_OFFSET_BY_STRIDE.get(stride, 0x40 if stride >= 0x44 else 0x18)
-            u_raw, v_raw = struct.unpack_from("<2H", self.data, offset + uv_offset)
-            mesh.uvs.append((u_raw / 65535.0, v_raw / 65535.0))
-            if stride == 84:
+            if stride >= 84:
+                nx, ny, nz = struct.unpack_from("<3f", self.data, offset + 0x0C)
+                u_raw, v_raw = struct.unpack_from("<2H", self.data, offset + 0x40)
+                mesh.uvs.append((u_raw / 65535.0, v_raw / 65535.0))
                 mesh.bone_indices.append(
                     struct.unpack_from("<4B", self.data, offset + 0x1C)
                 )
+            else:
+                # Eye (stride 44) and face (stride 60) vertices use half floats:
+                # RenderDoc event 608 / 90 show normal at 0x0c and UV at 0x18.
+                nx, ny, nz = struct.unpack_from("<3e", self.data, offset + 0x0C)
+                u, v = struct.unpack_from("<2e", self.data, offset + 0x18)
+                mesh.uvs.append((u, v))
+            mesh.normals.append((nx, ny, nz))
+
         mesh.indices = list(
             struct.unpack_from(f"<{index_count}H", self.data, index_ptr)
         )

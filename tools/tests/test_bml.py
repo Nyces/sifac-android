@@ -71,6 +71,34 @@ class BmlTests(unittest.TestCase):
         mtl = BmlArchive(raw).to_mtl()
         self.assertIn("newmtl", mtl)
 
+    def test_stride60_half_normals_and_uvs(self) -> None:
+        raw = build_bml_mesh(
+            stride=60,
+            positions=[(0.0, 0.0, 0.0)],
+            uvs=[(0.25, 0.75)],
+            normals=[(0.5, -0.25, 0.875)],
+        )
+        mesh = BmlArchive(raw).meshes()[0]
+        self.assertEqual(mesh.stride, 60)
+        for got, want in zip(mesh.normals[0], (0.5, -0.25, 0.875)):
+            self.assertAlmostEqual(got, want, places=3)
+        self.assertAlmostEqual(mesh.uvs[0][0], 0.25, places=3)
+        self.assertAlmostEqual(mesh.uvs[0][1], 0.75, places=3)
+        self.assertEqual(mesh.bone_indices, [])
+
+    def test_stride44_half_normals_and_uvs(self) -> None:
+        raw = build_bml_mesh(
+            stride=44,
+            positions=[(0.0, 0.0, 0.0)],
+            uvs=[(0.6, 0.55)],
+            normals=[(-0.25, -1.0, -0.04)],
+        )
+        mesh = BmlArchive(raw).meshes()[0]
+        for got, want in zip(mesh.normals[0], (-0.25, -1.0, -0.04)):
+            self.assertAlmostEqual(got, want, places=3)
+        self.assertAlmostEqual(mesh.uvs[0][0], 0.6, places=3)
+        self.assertAlmostEqual(mesh.uvs[0][1], 0.55, places=3)
+
     def test_bad_magic(self) -> None:
         with self.assertRaises(BmlError):
             BmlArchive(b"nope")

@@ -149,21 +149,28 @@ def build_bml_mesh(
     name: str = "test_mesh",
     positions: list[tuple[float, float, float]] | None = None,
     uvs: list[tuple[float, float]] | None = None,
+    normals: list[tuple[float, float, float]] | None = None,
+    stride: int = 84,
 ) -> bytes:
     """Build a minimal BML with one MESH chunk and its four DATA blocks."""
     positions = positions or [(0.0, 0.0, 0.0), (1.0, 0.0, 1.0)]
     uvs = uvs or [(0.0, 0.0), (1.0, 1.0)]
-    stride = 84
+    normals = normals or [(0.0, 0.0, 1.0) for _ in positions]
     vertex_count = len(positions)
     indices = [0, 1, 0] if vertex_count >= 2 else [0, 0, 0]
 
     name_payload = name.encode("ascii") + b"\0"
     vertex_payload = bytearray(vertex_count * stride)
-    for i, (position, uv) in enumerate(zip(positions, uvs)):
+    for i, (position, uv, normal) in enumerate(zip(positions, uvs, normals)):
         offset = i * stride
-        struct.pack_into("<6f", vertex_payload, offset, *position, 0.0, 0.0, 1.0)
-        struct.pack_into("<2H", vertex_payload, offset + 0x40,
-                         int(uv[0] * 65535), int(uv[1] * 65535))
+        struct.pack_into("<3f", vertex_payload, offset, *position)
+        if stride >= 84:
+            struct.pack_into("<3f", vertex_payload, offset + 0x0C, *normal)
+            struct.pack_into("<2H", vertex_payload, offset + 0x40,
+                             int(uv[0] * 65535), int(uv[1] * 65535))
+        else:
+            struct.pack_into("<3e", vertex_payload, offset + 0x0C, *normal)
+            struct.pack_into("<2e", vertex_payload, offset + 0x18, *uv)
     index_payload = struct.pack(f"<{len(indices)}H", *indices)
     counts_payload = struct.pack("<4I", vertex_count, 0, len(indices), 0)
 

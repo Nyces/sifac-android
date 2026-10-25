@@ -21,8 +21,13 @@ Formats confirmed against the retail dump:
     0x00  RGBA8, 4 bytes per pixel
     0x0d  BC7,   16 bytes per 4x4 block (1 byte per pixel)
 
-Format ``0x1b`` (8 bytes per pixel) is present on character face textures but
-has not been decoded yet; it is reported as ``UNKNOWN`` rather than guessed.
+Format ``0x1b`` (8 bytes per pixel, face-expression textures embedded in the
+model's BMT archive) has not been decoded yet. The stream carries two
+four-byte groups per pixel; the last group's final byte is a binary mask
+(0x0000 / 0x3c00 as half floats) that is shared by every expression of one
+character, so these are 2D face-part overlays rather than the 3D face texture
+(the model's face material uses ``honoka_body_01``). It is reported as
+``UNKNOWN`` rather than guessed.
 """
 
 from __future__ import annotations
@@ -211,3 +216,46 @@ def find_textures(data: bytes, limit: int = 0x400) -> list[int]:
         offsets.append(position)
         position += 1
     return offsets
+
+
+def load_texture_archive(pac_path: str | Path) -> dict[str, "BtxTexture"]:
+    """Load the model's ``texture`` ARC keyed by btx name.
+
+    A character ``.pac`` stores ``model.pac`` which contains the model entry and
+    a ``texture`` entry; the latter is another ARC whose payloads are btx files.
+    """
+    from .arc import ArcArchive, ArcError
+    from .binary import unwrap_section
+    from .pac import read_pac
+
+    image = read_pac(pac_path)
+    top = ArcArchive(image.data)
+    model_entry = top.find("model.pac")
+    if model_entry is None:
+        return {}
+    model_bytes, _ = unwrap_section(top.entry_data(model_entry))
+    model_arc = ArcArchive(model_bytes)
+    texture_entry = model_arc.find("texture")
+    if texture_entry is None:
+        texture_entry = next(
+            (entry for entry in model_arc.entries if entry.type == "texs"), None
+        )
+    if texture_entry is None:
+        return {}
+    texture_bytes, _ = unwrap_section(model_arc.entry_data(texture_entry))
+    try:
+        texture_arc = ArcArchive(texture_bytes)
+    except ArcError:
+        return {}
+    textures: dict[str, BtxTexture] = {}
+    for entry in texture_arc.entries:
+        payload, _ = unwrap_section(texture_arc.entry_data(entry))
+        try:
+            texture = BtxTexture(payload)
+        except BtxError:
+            continue
+        name = texture.header.name or entry.name
+        textures[name] = texture
+        textures.setdefault(entry.name, texture)
+    return textures
+
