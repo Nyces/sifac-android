@@ -47,6 +47,18 @@ def u64(data: bytes | bytearray | memoryview, offset: int) -> int:
     return struct.unpack_from("<Q", data, offset)[0]
 
 
+def be16(data: bytes | bytearray | memoryview, offset: int) -> int:
+    return struct.unpack_from(">H", data, offset)[0]
+
+
+def be24(data: bytes | bytearray | memoryview, offset: int) -> int:
+    return (data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2]
+
+
+def be32(data: bytes | bytearray | memoryview, offset: int) -> int:
+    return struct.unpack_from(">I", data, offset)[0]
+
+
 def cstring(data: bytes, offset: int, limit: int | None = None) -> str:
     """Read a NUL-terminated string, bounded by *limit* when given."""
     end = data.find(b"\0", offset)

@@ -4,17 +4,32 @@ import math
 import unittest
 
 from sifac.bml import Mesh, Node
-from sifac.skin import Skeleton, auto_weights, deform, invert, mat_mul, transform_point
+from sifac.skin import (
+    Skeleton,
+    auto_weights,
+    deform,
+    invert,
+    mat_mul,
+    palette_map,
+    transform_point,
+    weights_from_palette,
+)
 
 
-def node(index: int, name: str, parent: str, translation: tuple[float, float, float]) -> Node:
+def node(
+    index: int,
+    name: str,
+    parent: str,
+    translation: tuple[float, float, float],
+    rotation: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> Node:
     return Node(
         index=index,
         name=name,
         parent=parent,
         translation=translation,
         scale=(1.0, 1.0, 1.0),
-        rotation=(0.0, 0.0, 0.0),
+        rotation=rotation,
         bbox_min=(0.0, 0.0, 0.0),
         bbox_max=(0.0, 0.0, 0.0),
     )
@@ -82,6 +97,74 @@ class SkinTests(unittest.TestCase):
         identity = mat_mul(m, inv)
         for i in range(4):
             self.assertAlmostEqual(identity[i][i], 1.0, places=5)
+
+
+class BasisTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.skeleton = Skeleton(
+            [node(0, "Bone", "", (0.0, 0.0, 0.0), (0.0, 0.0, math.pi / 2))]
+        )
+        self.absolute = [[1.0 if i == j else 0.0 for j in range(4)] for i in range(4)]
+
+    def test_absolute_ignores_bind_rotation(self) -> None:
+        local = self.skeleton.local("Bone", absolute=self.absolute, basis="absolute")
+        point = transform_point(local, (1.0, 0.0, 0.0))
+        self.assertAlmostEqual(point[0], 1.0, places=5)
+        self.assertAlmostEqual(point[1], 0.0, places=5)
+
+    def test_post_applies_bind_rotation(self) -> None:
+        local = self.skeleton.local("Bone", absolute=self.absolute, basis="post")
+        point = transform_point(local, (1.0, 0.0, 0.0))
+        self.assertAlmostEqual(point[0], 0.0, places=5)
+        self.assertAlmostEqual(point[1], 1.0, places=5)
+
+    def test_quaternion_pose_rotates_rigidly(self) -> None:
+        skeleton = Skeleton(
+            [node(0, "Bone", "", (0.0, 0.0, 0.0))]
+        )
+        position = (1.0, 0.0, 1.0)
+        weights = [(["Bone"], [1.0])]
+        quat = (0.0, 0.0, math.sin(math.pi / 4), math.cos(math.pi / 4))
+        posed = deform([position], skeleton, weights, None, {"Bone": quat})
+        pivot = (0.0, 0.0, 0.0)
+        self.assertAlmostEqual(math.dist(posed[0], pivot), math.dist(position, pivot), places=5)
+        self.assertGreater(math.dist(posed[0], position), 1e-3)
+
+
+class PaletteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.skeleton = Skeleton(
+            [
+                node(0, "Bip001_Hips", "", (0.0, 0.0, 0.0)),
+                node(1, "Bip001_Spine", "Bip001_Hips", (0.0, 1.0, 0.0)),
+                node(2, "Bip001_Neck", "Bip001_Spine", (0.0, 1.0, 0.0)),
+            ]
+        )
+        self.mesh = Mesh(
+            name="palette",
+            vertex_count=2,
+            index_count=0,
+            stride=84,
+            positions=[(0.0, 0.0, 0.5), (0.0, 0.0, 1.5)],
+            normals=[(0.0, 0.0, 1.0), (0.0, 0.0, 1.0)],
+            uvs=[(0.0, 0.0), (1.0, 1.0)],
+            indices=[],
+            bone_indices=[(1, 0, 0, 0), (2, 0, 0, 0)],
+        )
+
+    def test_palette_map_recovers_bones(self) -> None:
+        mapping = palette_map([self.mesh], self.skeleton)
+        self.assertEqual(mapping[1], "Bip001_Hips")
+        self.assertEqual(mapping[2], "Bip001_Spine")
+
+    def test_weights_from_palette_uses_vertex_indices(self) -> None:
+        mapping = {1: "Bip001_Hips", 2: "Bip001_Spine"}
+        weights = weights_from_palette(self.mesh, self.skeleton, mapping)
+        self.assertEqual(len(weights), 2)
+        self.assertEqual(weights[0][0], ["Bip001_Hips"])
+        self.assertEqual(weights[1][0], ["Bip001_Spine"])
+        for _bones, values in weights:
+            self.assertAlmostEqual(sum(values), 1.0, places=5)
 
 
 if __name__ == "__main__":

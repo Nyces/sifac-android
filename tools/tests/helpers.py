@@ -91,6 +91,7 @@ def build_awb(entries: list[tuple[int, bytes]], magic: bytes = b"HCA\0") -> byte
     offsets: list[int] = []
     payloads = bytearray()
     for entry_id, payload in entries:
+        payloads += b"\0" * (align_up(len(payloads), 0x20) - len(payloads))
         offsets.append(data_start + len(payloads))
         payloads += magic + payload
     result = bytearray(data_start + len(payloads))

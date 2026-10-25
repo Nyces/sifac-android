@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .binary import u16, u32
+from .binary import align_up, u16, u32
+
+# Retail SIFAC AWBs store the raw stream offset, but every HCA payload starts at
+# the next 0x20-byte boundary after it (verified on all 10,839 entries).
+DATA_ALIGN = 0x20
 
 
 class AwbError(ValueError):
@@ -48,17 +52,21 @@ class Afs2Archive:
             if offset < previous or offset >= len(data):
                 raise AwbError(f"invalid AWB entry offset: {offset:#x}")
             previous = offset
+        self.starts = tuple(align_up(offset, DATA_ALIGN) for offset in self.offsets)
+        for start in self.starts:
+            if start >= len(data):
+                raise AwbError(f"AWB entry start is past the end: {start:#x}")
         self.entries = tuple(self._read_entries())
 
     def _read_entries(self) -> list[Afs2Entry]:
         entries: list[Afs2Entry] = []
-        for index, (entry_id, offset) in enumerate(zip(self.ids, self.offsets)):
+        for index, (entry_id, start) in enumerate(zip(self.ids, self.starts)):
             end = (
-                self.offsets[index + 1]
+                self.starts[index + 1]
                 if index + 1 < self.count
                 else len(self.data)
             )
-            head = self.data[offset : offset + 0x40]
+            head = self.data[start : start + 0x40]
             magic = "?"
             for candidate in (b"HCA\0", b"ADX\0", b"AFS2", b"RIFF"):
                 if candidate in head:
@@ -68,8 +76,8 @@ class Afs2Archive:
                 Afs2Entry(
                     index=index,
                     id=entry_id,
-                    offset=offset,
-                    size=end - offset,
+                    offset=start,
+                    size=end - start,
                     magic=magic,
                 )
             )

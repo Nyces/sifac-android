@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .arc import ArcArchive, ArcError
+from .audio import HcaError
 from .awb import Afs2Archive, AwbError
 from .binary import hexdump, unwrap_section
 from .bmar import BmarArchive, BmarError, find_bmar_in_pac, scan_magics
@@ -399,15 +400,18 @@ def cmd_anim(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_pose(args: argparse.Namespace) -> int:
-    import math
+def _pose_meshes(
+    archive: object,
+    skeleton: object,
+    meshes: list,
+    pose: dict[str, tuple[float, float, float]] | None = None,
+    pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
+    influences: int = 2,
+) -> tuple[list, dict[int, str], int]:
+    """Skin every mesh with either palette weights or automatic weights."""
+    from .bml import Mesh
+    from .skin import auto_weights, deform, palette_map, weights_from_palette
 
-    from .bml import Mesh, find_bml_in_pac, render_silhouette
-    from .skin import Skeleton, auto_weights, deform, palette_map, weights_from_palette
-
-    archive = find_bml_in_pac(args.pac, args.character)
-    skeleton = Skeleton(archive.nodes())
-    meshes = archive.meshes()
     biped = [name for name in skeleton.nodes if name.startswith("Bip001_")]
     hair = [name for name in skeleton.nodes if "_bon_" in name]
     head = [
@@ -417,17 +421,6 @@ def cmd_pose(args: argparse.Namespace) -> int:
     mapping = palette_map(meshes, skeleton, biped + hair + head) if any(
         mesh.bone_indices for mesh in meshes
     ) else {}
-    pose: dict[str, tuple[float, float, float]] = {}
-    for spec in args.rotate:
-        name, _, values = spec.partition("=")
-        if not values:
-            print(f"error: invalid --rotate {spec!r}, expected BONE=rx,ry,rz", file=sys.stderr)
-            return 1
-        parts = [float(v) for v in values.split(",")]
-        if len(parts) != 3:
-            print(f"error: invalid --rotate {spec!r}", file=sys.stderr)
-            return 1
-        pose[name.strip()] = tuple(math.radians(v) for v in parts)  # type: ignore[assignment]
     posed: list[Mesh] = []
     skipped = 0
     for mesh in meshes:
@@ -449,9 +442,9 @@ def cmd_pose(args: argparse.Namespace) -> int:
         weights = (
             weights_from_palette(mesh, skeleton, mapping, candidates)
             if mesh.bone_indices and mapping
-            else auto_weights(mesh, skeleton, args.influences, candidates)
+            else auto_weights(mesh, skeleton, influences, candidates)
         )
-        positions = deform(mesh.positions, skeleton, weights, pose)
+        positions = deform(mesh.positions, skeleton, weights, pose, pose_quat)
         posed.append(
             Mesh(
                 name=mesh.name,
@@ -464,6 +457,30 @@ def cmd_pose(args: argparse.Namespace) -> int:
                 indices=mesh.indices,
             )
         )
+    return posed, mapping, skipped
+
+
+def cmd_pose(args: argparse.Namespace) -> int:
+    import math
+
+    from .bml import find_bml_in_pac, render_silhouette
+    from .skin import Skeleton
+
+    archive = find_bml_in_pac(args.pac, args.character)
+    skeleton = Skeleton(archive.nodes())
+    meshes = archive.meshes()
+    pose: dict[str, tuple[float, float, float]] = {}
+    for spec in args.rotate:
+        name, _, values = spec.partition("=")
+        if not values:
+            print(f"error: invalid --rotate {spec!r}, expected BONE=rx,ry,rz", file=sys.stderr)
+            return 1
+        parts = [float(v) for v in values.split(",")]
+        if len(parts) != 3:
+            print(f"error: invalid --rotate {spec!r}", file=sys.stderr)
+            return 1
+        pose[name.strip()] = tuple(math.radians(v) for v in parts)  # type: ignore[assignment]
+    posed, mapping, skipped = _pose_meshes(archive, skeleton, meshes, pose, None, args.influences)
     print(
         f"{args.pac}: posed {len(posed)} mesh(es), {sum(m.vertex_count for m in posed)} vertices, "
         f"{len(pose)} bone(s) rotated, {skipped} local mesh(es) left as-is, "
@@ -475,6 +492,117 @@ def cmd_pose(args: argparse.Namespace) -> int:
     if args.png:
         Path(args.png).write_bytes(render_silhouette(posed))
         print(f"wrote {args.png}")
+    return 0
+
+
+def cmd_animate(args: argparse.Namespace) -> int:
+    from .anim import BmaError, load_motion
+    from .bml import find_bml_in_pac, render_silhouette
+    from .skin import Skeleton
+
+    archive = find_bml_in_pac(args.pac, args.character)
+    skeleton = Skeleton(archive.nodes())
+    meshes = archive.meshes()
+    animation = load_motion(args.pac, args.clip)
+    pose_quat: dict[str, tuple[float, float, float, float]] = {}
+    last_frame = 0.0
+    missing = []
+    for track in animation.tracks:
+        if track.name not in skeleton.nodes:
+            missing.append(track.name)
+            continue
+        keys = animation.rotation_keys(track)
+        if keys is None:
+            continue
+        if keys.times:
+            last_frame = max(last_frame, keys.times[-1])
+        pose_quat[track.name] = keys.sample(args.frame)
+    if not pose_quat:
+        print(f"error: no rotation keys decoded from {args.clip}", file=sys.stderr)
+        return 1
+    posed, mapping, skipped = _pose_meshes(
+        archive, skeleton, meshes, None, pose_quat, args.influences
+    )
+    print(
+        f"{args.pac}: {args.clip} frame={args.frame:g}/{last_frame:g}, "
+        f"{len(pose_quat)} track(s) applied, {len(missing)} unmatched, "
+        f"palette={len(mapping)}, {skipped} local mesh(es) left as-is"
+    )
+    if args.obj:
+        Path(args.obj).write_text(archive.to_obj_for(posed), encoding="utf-8")
+        print(f"wrote {args.obj}")
+    if args.png:
+        Path(args.png).write_bytes(render_silhouette(posed))
+        print(f"wrote {args.png}")
+    return 0
+
+
+def cmd_hca(args: argparse.Namespace) -> int:
+    from .audio import HcaError, decode_hca, read_hca_info, read_wav_info
+
+    path = Path(args.file)
+    raw = path.read_bytes()
+    keycode = args.key
+    is_awb = raw[:4] == b"AFS2"
+    if is_awb:
+        archive = Afs2Archive(raw)
+        if args.list:
+            print(f"{path}: AFS2 v{archive.version}, {archive.count} HCA stream(s)")
+            for entry in archive.entries[: args.limit]:
+                data = archive.entry_data(entry.index)
+                try:
+                    info = read_hca_info(data)
+                except HcaError as exc:
+                    print(f"  {entry.index:4d} id={entry.id:5d} {entry.size:>10} {exc}")
+                    continue
+                print(
+                    f"  {entry.index:4d} id={entry.id:5d} off={entry.offset:#010x} "
+                    f"size={entry.size:>10} {info.channels}ch {info.sample_rate}Hz "
+                    f"{info.duration:7.2f}s cipher={info.cipher_type}"
+                )
+            return 0
+        if args.all:
+            out_dir = Path(args.outdir or (path.parent / f"{path.stem}_wav"))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            written = 0
+            for entry in archive.entries:
+                data = archive.entry_data(entry.index)
+                try:
+                    info = read_hca_info(data)
+                    wav = decode_hca(data, keycode)
+                except HcaError as exc:
+                    print(f"  skip {entry.index}: {exc}", file=sys.stderr)
+                    continue
+                target = out_dir / f"{entry.index:04d}_{entry.id:04d}.wav"
+                target.write_bytes(wav)
+                written += 1
+                print(f"{target} ({info.duration:.2f}s, {len(wav):,} bytes)")
+            print(f"wrote {written} WAV file(s) to {out_dir}")
+            return 0
+        if not 0 <= args.entry < len(archive.entries):
+            print(f"error: entry {args.entry} out of range 0..{len(archive.entries) - 1}", file=sys.stderr)
+            return 1
+        entry = archive.entries[args.entry]
+        data = archive.entry_data(args.entry)
+        default_out = path.parent / f"{path.stem}_{entry.id:04d}.wav"
+    else:
+        data = raw
+        default_out = path.with_suffix(".wav")
+
+    info = read_hca_info(data)
+    wav = decode_hca(data, keycode)
+    wav_info = read_wav_info(wav)
+    print(
+        f"{path}: {info.channels}ch {info.sample_rate}Hz, {info.block_count} blocks "
+        f"({info.duration:.2f}s), cipher={info.cipher_type}, block={info.block_size} bytes"
+    )
+    if not args.dry_run:
+        target = Path(args.out) if args.out else default_out
+        target.write_bytes(wav)
+        print(
+            f"wrote {target} ({wav_info.channels}ch {wav_info.sample_rate}Hz "
+            f"{wav_info.bits_per_sample}-bit, {wav_info.duration:.2f}s)"
+        )
     return 0
 
 
@@ -538,6 +666,18 @@ def build_parser() -> argparse.ArgumentParser:
     awb.add_argument("--extract")
     awb.set_defaults(func=cmd_awb)
 
+    hca = sub.add_parser("hca", help="inspect or decode HCA audio in an AWB or .hca file")
+    hca.add_argument("file")
+    hca.add_argument("--entry", type=int, default=0)
+    hca.add_argument("--list", action="store_true")
+    hca.add_argument("--limit", type=int, default=40)
+    hca.add_argument("--all", action="store_true")
+    hca.add_argument("--outdir")
+    hca.add_argument("--out")
+    hca.add_argument("--key", type=lambda value: int(value, 0), default=None)
+    hca.add_argument("--dry-run", action="store_true")
+    hca.set_defaults(func=cmd_hca)
+
     bmar = sub.add_parser("bmar", help="parse a BMAR model archive or a PAC containing one")
     bmar.add_argument("path")
     bmar.add_argument("--magics", action="store_true")
@@ -594,6 +734,16 @@ def build_parser() -> argparse.ArgumentParser:
     pose.add_argument("--png")
     pose.set_defaults(func=cmd_pose)
 
+    animate = sub.add_parser("animate", help="apply a motion clip at one frame and export the result")
+    animate.add_argument("pac")
+    animate.add_argument("clip")
+    animate.add_argument("--character", default=None)
+    animate.add_argument("--frame", type=float, default=0.0)
+    animate.add_argument("--influences", type=int, default=2)
+    animate.add_argument("--obj")
+    animate.add_argument("--png")
+    animate.set_defaults(func=cmd_animate)
+
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")
     dump.add_argument("--offset", type=lambda value: int(value, 0), default=0)
@@ -611,7 +761,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (PacError, ArcError, BmarError, AwbError, ScoreError, SfoError) as exc:
+    except (PacError, ArcError, BmarError, AwbError, HcaError, ScoreError, SfoError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

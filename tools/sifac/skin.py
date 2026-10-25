@@ -130,12 +130,13 @@ class Skeleton:
         name: str,
         extra: list[list[float]] | None = None,
         absolute: list[list[float]] | None = None,
+        basis: str = "absolute",
     ) -> list[list[float]]:
         node = self.nodes[name]
         m = identity()
         m[0][3], m[1][3], m[2][3] = node.translation
         if absolute is not None:
-            rotation = absolute
+            rotation = _apply_quat_basis(node, absolute, basis)
         else:
             rx, ry, rz = node.rotation
             rotation = mat_mul(mat_mul(rot_z(rz), rot_y(ry)), rot_x(rx))
@@ -151,6 +152,7 @@ class Skeleton:
         name: str,
         pose: dict[str, tuple[float, float, float]] | None = None,
         pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
+        basis: str = "absolute",
     ) -> list[list[float]]:
         """World matrix in mesh space (Z up)."""
         chain: list[str] = []
@@ -167,7 +169,7 @@ class Skeleton:
             elif pose and bone in pose:
                 rx, ry, rz = pose[bone]
                 extra = mat_mul(mat_mul(rot_z(rz), rot_y(ry)), rot_x(rx))
-            matrix = mat_mul(matrix, self.local(bone, extra, absolute))
+            matrix = mat_mul(matrix, self.local(bone, extra, absolute, basis))
         return mat_mul(mat_mul(_AXIS, matrix), _AXIS_INV)
 
     def segments(self) -> list[BoneSegment]:
@@ -318,17 +320,42 @@ def weights_from_palette(
     return result
 
 
+def _bind_rotation(node: Node) -> list[list[float]]:
+    rx, ry, rz = node.rotation
+    return mat_mul(mat_mul(rot_z(rz), rot_y(ry)), rot_x(rx))
+
+
+def _apply_quat_basis(node: Node, q: list[list[float]], basis: str) -> list[list[float]]:
+    """Combine a clip rotation with the node's bind rotation.
+
+    The animation quaternions are authored in a different local frame than the
+    bind pose, so several conventions are possible. ``basis`` selects one:
+    ``absolute`` replaces the bind rotation, ``post`` applies the clip after it,
+    ``pre`` before it, and ``sandwich`` treats the bind rotation as a change of
+    basis (``R * q * R^-1``).
+    """
+    if basis == "absolute":
+        return q
+    r = _bind_rotation(node)
+    if basis == "pre":
+        return mat_mul(q, r)
+    if basis == "sandwich":
+        return mat_mul(mat_mul(r, q), invert(r))
+    return mat_mul(r, q)
+
+
 def deform(
     positions: list[tuple[float, float, float]],
     skeleton: Skeleton,
     weights: list[tuple[list[int], list[float]]],
     pose: dict[str, tuple[float, float, float]] | None = None,
     pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
+    basis: str = "absolute",
 ) -> list[tuple[float, float, float]]:
     """Apply a pose (bone name -> extra rotation)."""
     names = sorted({name for bones, _ in weights for name in bones})
     bind = {name: invert(skeleton.world(name)) for name in names}
-    posed = {name: skeleton.world(name, pose, pose_quat) for name in names}
+    posed = {name: skeleton.world(name, pose, pose_quat, basis) for name in names}
     deltas = {name: mat_mul(posed[name], bind[name]) for name in names}
     out: list[tuple[float, float, float]] = []
     for position, (bones, bone_weights) in zip(positions, weights):
