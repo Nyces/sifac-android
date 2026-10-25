@@ -822,6 +822,29 @@ def cmd_live(args: argparse.Namespace) -> int:
     png = render_meshes(wire, textures, args.width, args.height, camera=camera)
     Path(args.out).write_bytes(png)
     print(f"wrote {args.out}")
+
+    if args.audio:
+        from .audio import decode_hca, read_hca_info, read_wav_info
+        from .awb import Afs2Archive
+
+        music = root / "sound" / "dlc" / f"MUSIC_{song}.awb"
+        if not music.exists():
+            print(f"warning: {music} not found, skipping audio", file=sys.stderr)
+            return 0
+        archive = Afs2Archive(music.read_bytes())
+        data = archive.entry_data(0)
+        info = read_hca_info(data)
+        wav = decode_hca(data)
+        wav_info = read_wav_info(wav)
+        Path(args.audio).write_bytes(wav)
+        print(
+            f"wrote {args.audio} ({wav_info.channels}ch {wav_info.sample_rate}Hz, "
+            f"{wav_info.duration:.2f}s)"
+        )
+        print(
+            f"  frame {args.frame:g} at 60 fps = {args.frame / 60.0:.2f}s, "
+            f"track length {info.duration:.2f}s"
+        )
     return 0
 
 
@@ -1001,6 +1024,7 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--width", type=int, default=480)
     live.add_argument("--height", type=int, default=270)
     live.add_argument("--out", required=True)
+    live.add_argument("--audio", default=None, metavar="WAV")
     live.set_defaults(func=cmd_live)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
