@@ -29,7 +29,7 @@ The character timeline holds one 0x40-byte record per performer, followed by
     +0x0c u16 u16   (49, 68 in every record of song 0010)
     +0x10 f32 0, f32 a, f32 b, f32 c
     +0x20 f32 x, f32 y, f32 z    performer placement
-    +0x2c f32 15.0
+    +0x2c f32 marker            15.0 for songs 0010/0020, 13.0 for 0030
     +0x30 16 zero bytes
     +0x60 cue list, 28 bytes per cue::
 
@@ -52,14 +52,20 @@ Placement is only verified for song 0010, where one axis stays near 1.4 m for
 all nine performers (chest/head height, or a depth offset) while the other two
 spread over 7.0 m and 1.8 m; taking the two spread axes as the floor plan keeps
 every pair at least 1.32 m apart, whereas either alternative puts two performers
-0.14 m or 0.05 m apart. Song 0020 matches the same record signature at two
-offsets 0x20 apart and songs 0030/0050 carry no match at all, so the record size
-is not universal yet; consumers must fall back when fewer records than
-performers are found.
+0.14 m or 0.05 m apart.
+
+The record signature is `u32 0, u32 end tick, u32 1` plus a 1..64 float at +0x2c
+and a non-zero placement, which finds nine records in songs 0010, 0020 and 0050
+and none or one in others (0030/0040: one, 0060: none, 0070: five) even though
+every song ships nine character packs. Those timelines use a slightly different
+record — 0030's only match carries extra floats at +0x34 and a four-byte gap
+before its cue list — so the layout is not fully general yet and consumers must
+fall back to a placeholder layout whenever fewer records than performers appear.
 """
 
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,7 +77,6 @@ HEADER_SIZE = 0x80
 CHANNEL_TABLE = 0xA0
 CHANNEL_ENTRY_SIZE = 16
 RECORD_SIZE = 0x40
-RECORD_MARKER = 15.0
 CUE_START = 0x60
 CUE_SIZE = 0x1C
 CUE_CHANNEL = 0x000C000A
@@ -197,10 +202,14 @@ class Btlb:
     def _is_chara_record(self, offset: int) -> bool:
         if u32(self.data, offset) != 0 or u32(self.data, offset + 8) != 1:
             return False
-        marker = struct.unpack_from("<f", self.data, offset + 0x2C)[0]
-        if abs(marker - RECORD_MARKER) > 1e-6:
+        tick = u32(self.data, offset + 4)
+        if not 0 < tick <= 0x10000:
             return False
-        return self.data[offset + 0x30 : offset + 0x3C] == bytes(12)
+        marker = struct.unpack_from("<f", self.data, offset + 0x2C)[0]
+        if not (1.0 <= marker <= 64.0):
+            return False
+        place = struct.unpack_from("<3f", self.data, offset + 0x20)
+        return max(abs(value) for value in place) >= 0.3
 
 
 def load_timelines(pac_path: str | Path) -> dict[str, Btlb]:

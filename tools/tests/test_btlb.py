@@ -68,8 +68,8 @@ class BtlbTests(unittest.TestCase):
         self.assertEqual(records[0].ids, (49, 68))
         self.assertAlmostEqual(records[0].marker, 15.0)
 
-    def test_marker_is_required(self) -> None:
-        timeline = Btlb(build_btlb([build_record((1.0, 2.0, 3.0), marker=16.0)]))
+    def test_origin_placements_are_rejected(self) -> None:
+        timeline = Btlb(build_btlb([build_record((0.0, 0.0, 0.0))]))
         self.assertEqual(timeline.chara_records(), [])
 
     def test_cues_are_parsed(self) -> None:
