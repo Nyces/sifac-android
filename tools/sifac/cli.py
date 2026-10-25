@@ -375,6 +375,30 @@ def cmd_mesh(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_anim(args: argparse.Namespace) -> int:
+    from .anim import BmaError, find_bma_in_pac, list_motions
+
+    if args.list:
+        motions = list_motions(args.pac, args.character)
+        print(f"{args.pac}: {len(motions)} animation(s)")
+        for motion in motions[: args.limit]:
+            print(
+                f"  {motion['name']:40s} size={motion['size']:>8} "
+                f"tracks={motion['tracks']:3d} anhd={motion['duration']:.2f}"
+            )
+        return 0
+    animation = find_bma_in_pac(args.pac, args.character)
+    print(
+        f"{args.pac}: version={animation.version} duration={animation.duration:.2f} "
+        f"tracks={len(animation.tracks)}"
+    )
+    for track in animation.tracks[: args.limit]:
+        channels = animation.channels(track)
+        kinds = ",".join(str(c[2]) for c in channels)
+        print(f"  {track.name:34s} records={track.key_count} kinds=[{kinds}]")
+    return 0
+
+
 def cmd_hexdump(args: argparse.Namespace) -> int:
     data = Path(args.file).read_bytes()
     for line in hexdump(data, offset=args.offset, length=args.length):
@@ -474,6 +498,13 @@ def build_parser() -> argparse.ArgumentParser:
     mesh.add_argument("--mtl")
     mesh.add_argument("--png")
     mesh.set_defaults(func=cmd_mesh)
+
+    anim = sub.add_parser("anim", help="inspect a character's animation tracks and motions")
+    anim.add_argument("pac")
+    anim.add_argument("--character", default=None)
+    anim.add_argument("--list", action="store_true")
+    anim.add_argument("--limit", type=int, default=15)
+    anim.set_defaults(func=cmd_anim)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")
