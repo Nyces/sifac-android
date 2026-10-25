@@ -999,6 +999,15 @@ def cmd_btlb(args: argparse.Namespace) -> int:
                             "ids": list(record.ids),
                             "blend": list(record.blend),
                             "position": list(record.position),
+                            "cues": [
+                                {
+                                    "ident": cue.ident,
+                                    "tag": cue.tag,
+                                    "start_tick": cue.start_tick,
+                                    "length": cue.length,
+                                }
+                                for cue in record.cues
+                            ],
                         }
                         for record in timeline.chara_records()
                     ],
@@ -1015,11 +1024,22 @@ def cmd_btlb(args: argparse.Namespace) -> int:
         )
         for index, record in enumerate(records):
             x, y, z = record.position
+            span = (
+                f"{record.cues[0].start_tick}..{max(c.start_tick + c.length for c in record.cues)}"
+                if record.cues
+                else "-"
+            )
             print(
                 f"  [{index}] pos=({x:8.3f},{y:8.3f},{z:8.3f}) "
-                f"end_tick={record.end_tick:6d} ids={record.ids} "
-                f"blend=({record.blend[1]:.3f},{record.blend[2]:.3f},{record.blend[3]:.3f})"
+                f"end_tick={record.end_tick:6d} cues={len(record.cues):2d} span={span} "
+                f"ids={record.ids} blend=({record.blend[1]:.3f},{record.blend[2]:.3f},{record.blend[3]:.3f})"
             )
+            for cue in record.cues[: args.limit]:
+                print(
+                    f"        ident={cue.ident:3d} tick=[{cue.start_tick:5d},"
+                    f"{cue.start_tick + cue.length:5d}] tag={cue.tag:#010x} "
+                    f"weight={cue.weight:g}"
+                )
     return 0
 
 
@@ -1214,6 +1234,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     btl = sub.add_parser("btlb", help="inspect a song pack's .btlb timelines")
     btl.add_argument("pac")
+    btl.add_argument("--limit", type=int, default=6, help="cues printed per performer")
     btl.add_argument("--json", action="store_true")
     btl.set_defaults(func=cmd_btlb)
 

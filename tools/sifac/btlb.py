@@ -21,7 +21,7 @@ Every live song ships four timelines::
     scene_chara_<song>_<n>.btlb       one record per performer
 
 The character timeline holds one 0x40-byte record per performer, followed by
-that performer's keyframe tables::
+0x20 reserved bytes and that performer's cue list::
 
     +0x00 u32 0
     +0x04 u32 last cue tick
@@ -31,20 +31,37 @@ that performer's keyframe tables::
     +0x20 f32 x, f32 y, f32 z    performer placement
     +0x2c f32 15.0
     +0x30 16 zero bytes
+    +0x60 cue list, 28 bytes per cue::
 
-The placement axes are **not** verified yet: song 0010 keeps one axis near 1.4
-for all nine performers (chest/head height, or a depth offset) while the other
-two spread over 7.0 m and 1.8 m. Song 0020 spreads all three axes, so the
-interpretation cannot be settled from the data alone; a RenderDoc capture of a
-live frame would show the performer world matrices directly. In the meantime
-the records are exposed verbatim rather than guessed: every retail song checked
-carries exactly nine of them, matching the nine performers.
+              +0x00 u32 0x000c000a   (channel 12, kind 10)
+              +0x04 u32 0
+              +0x08 u32 ident        (48..98 in song 0010)
+              +0x0c u16 7, u16 100   (99 in a few cues)
+              +0x10 f32 weight       (always 1.0 so far)
+              +0x14 u32 start tick
+              +0x18 u32 length (ticks, clamped at 12000 for the last cue)
+
+The cue intervals are disjoint and shared across the nine performers, so they
+are timeline *segments* rather than per-performer timing; the ``ident`` differs
+per performer inside a segment. The ident comes from a shared namespace: songs
+0010 and 0020 both use 64/65/72/73/74/78/81/82 and add their own values. Its
+meaning is still open, and it cannot select a dance take because each live
+character pack holds exactly one 6.5 MB motion clip.
+
+Placement is only verified for song 0010, where one axis stays near 1.4 m for
+all nine performers (chest/head height, or a depth offset) while the other two
+spread over 7.0 m and 1.8 m; taking the two spread axes as the floor plan keeps
+every pair at least 1.32 m apart, whereas either alternative puts two performers
+0.14 m or 0.05 m apart. Song 0020 matches the same record signature at two
+offsets 0x20 apart and songs 0030/0050 carry no match at all, so the record size
+is not universal yet; consumers must fall back when fewer records than
+performers are found.
 """
 
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .binary import u32
@@ -55,6 +72,10 @@ CHANNEL_TABLE = 0xA0
 CHANNEL_ENTRY_SIZE = 16
 RECORD_SIZE = 0x40
 RECORD_MARKER = 15.0
+CUE_START = 0x60
+CUE_SIZE = 0x1C
+CUE_CHANNEL = 0x000C000A
+CUE_LIMIT = 4096
 
 
 class BtlbError(ValueError):
@@ -70,8 +91,20 @@ class BtlbChannel:
 
 
 @dataclass(frozen=True)
+class Cue:
+    """One channel cue of a performer's timeline segment."""
+
+    channel: int
+    ident: int
+    tag: int
+    weight: float
+    start_tick: int
+    length: int
+
+
+@dataclass(frozen=True)
 class CharaRecord:
-    """One performer placement record of a character timeline."""
+    """One performer record of a character timeline."""
 
     offset: int
     end_tick: int
@@ -79,6 +112,7 @@ class CharaRecord:
     blend: tuple[float, float, float, float]
     position: tuple[float, float, float]
     marker: float
+    cues: tuple[Cue, ...] = field(default_factory=tuple)
 
 
 class Btlb:
@@ -110,8 +144,9 @@ class Btlb:
         return channels
 
     def chara_records(self) -> list[CharaRecord]:
-        """Return every performer placement record found in the payload."""
+        """Return every performer record found in the payload."""
         records: list[CharaRecord] = []
+        offsets: list[int] = []
         position = CHANNEL_TABLE
         limit = len(self.data) - RECORD_SIZE
         while position <= limit:
@@ -121,13 +156,43 @@ class Btlb:
                 blend = struct.unpack_from("<4f", self.data, position + 0x10)
                 place = struct.unpack_from("<3f", self.data, position + 0x20)
                 marker = struct.unpack_from("<f", self.data, position + 0x2C)[0]
+                offsets.append(position)
                 records.append(
                     CharaRecord(position, head[1], ids, blend, place, marker)
                 )
                 position += RECORD_SIZE
                 continue
             position += 4
-        return records
+        if not records:
+            return records
+        bounds = offsets[1:] + [len(self.data)]
+        return [
+            CharaRecord(
+                record.offset,
+                record.end_tick,
+                record.ids,
+                record.blend,
+                record.position,
+                record.marker,
+                tuple(self._read_cues(record.offset + CUE_START, end)),
+            )
+            for record, end in zip(records, bounds)
+        ]
+
+    def _read_cues(self, start: int, end: int) -> list[Cue]:
+        cues: list[Cue] = []
+        position = start
+        while position + CUE_SIZE <= end and len(cues) < CUE_LIMIT:
+            channel, zero, ident, tag = struct.unpack_from("<4I", self.data, position)
+            if channel != CUE_CHANNEL or zero != 0:
+                break
+            weight = struct.unpack_from("<f", self.data, position + 0x10)[0]
+            start_tick, length = struct.unpack_from(
+                "<2I", self.data, position + 0x14
+            )
+            cues.append(Cue(channel, ident, tag, weight, start_tick, length))
+            position += CUE_SIZE
+        return cues
 
     def _is_chara_record(self, offset: int) -> bool:
         if u32(self.data, offset) != 0 or u32(self.data, offset + 8) != 1:
