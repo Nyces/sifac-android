@@ -129,6 +129,62 @@ class Skeleton:
                 self.children[node.parent].append(node.name)
         self._world: dict[str, list[list[float]]] = {}
         self._segments: list[BoneSegment] | None = None
+        self._bind_all: dict[str, list[list[float]]] | None = None
+        self._order: list[str] | None = None
+
+    def order(self) -> list[str]:
+        """Every node, guaranteed to appear after its parent."""
+        if self._order is None:
+            ordered: list[str] = []
+            seen: set[str] = set()
+            for name in self.nodes:
+                chain: list[str] = []
+                current: str | None = name
+                while current and current in self.nodes and current not in seen:
+                    chain.append(current)
+                    current = self.nodes[current].parent
+                for bone in reversed(chain):
+                    if bone not in seen:
+                        seen.add(bone)
+                        ordered.append(bone)
+            self._order = ordered
+        return self._order
+
+    def world_all(
+        self,
+        pose: dict[str, tuple[float, float, float]] | None = None,
+        pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
+        basis: str = "absolute",
+    ) -> dict[str, list[list[float]]]:
+        """Every node's world matrix in one root-first pass.
+
+        ``world(name)`` walks the ancestor chain once per node, which costs
+        O(nodes * depth). Skinning needs the whole rig every frame, so this
+        pass is used instead and the bind pose is cached.
+        """
+        bind = pose is None and pose_quat is None
+        if bind and self._bind_all is not None:
+            return self._bind_all
+        plain: dict[str, list[list[float]]] = {}
+        for name in self.order():
+            node = self.nodes[name]
+            base = plain.get(node.parent) if node.parent in self.nodes else None
+            extra = None
+            absolute = None
+            if pose_quat and name in pose_quat:
+                absolute = mat_from_quat(pose_quat[name])
+            elif pose and name in pose:
+                rx, ry, rz = pose[name]
+                extra = mat_mul(mat_mul(rot_z(rz), rot_y(ry)), rot_x(rx))
+            parent = base if base is not None else identity()
+            plain[name] = mat_mul(parent, self.local(name, extra, absolute, basis))
+        result = {
+            name: mat_mul(mat_mul(_AXIS, matrix), _AXIS_INV)
+            for name, matrix in plain.items()
+        }
+        if bind:
+            self._bind_all = result
+        return result
 
     def local(
         self,
@@ -336,6 +392,98 @@ def weights_from_palette(
         total = sum(weight for weight, _ in scored) or 1.0
         result.append(([n for _, n in scored], [w / total for w, _ in scored]))
     return result
+
+
+def rig_groups(skeleton: Skeleton) -> dict[str, list[str]]:
+    """Bone name groups a character mesh may be skinned to."""
+    return {
+        "biped": [name for name in skeleton.nodes if name.startswith("Bip001_")],
+        "hair": [name for name in skeleton.nodes if "_bon_" in name],
+        "head": [
+            name for name in skeleton.nodes
+            if name in ("Bip001_Head", "Bip001_Neck", "Honoka_head_set")
+        ],
+    }
+
+
+def mesh_candidates(groups: dict[str, list[str]], mesh: Mesh) -> list[str]:
+    """Bones a mesh may follow: hair bones for hair, the head for the face."""
+    lower = mesh.name.lower()
+    if "hair" in lower:
+        return groups["hair"] + groups["head"]
+    if "face" in lower or "eye" in lower:
+        return groups["head"]
+    return groups["biped"]
+
+
+def build_weights(
+    meshes: list[Mesh],
+    skeleton: Skeleton,
+    influences: int = 2,
+) -> tuple[dict[int, str], list[list[tuple[list[str], list[float]]] | None]]:
+    """Bone palette mapping plus per-mesh weight lists.
+
+    ``None`` marks a mesh that is not skinned: eye and face meshes are rigid and
+    get anchored to their node instead, and stage or prop models have no rig.
+    """
+    groups = rig_groups(skeleton)
+    every = groups["biped"] + groups["hair"] + groups["head"]
+    mapping = (
+        palette_map(meshes, skeleton, every)
+        if any(mesh.bone_indices for mesh in meshes)
+        else {}
+    )
+    weights: list[list[tuple[list[str], list[float]]] | None] = []
+    for mesh in meshes:
+        candidates = mesh_candidates(groups, mesh)
+        if mesh.stride in (44, 60) or not candidates:
+            weights.append(None)
+            continue
+        weights.append(
+            weights_from_palette(mesh, skeleton, mapping, candidates)
+            if mesh.bone_indices and mapping
+            else auto_weights(mesh, skeleton, influences, candidates)
+        )
+    return mapping, weights
+
+
+def rigid_matrix(
+    mesh_index: int,
+    mesh: Mesh,
+    draw_nodes: dict[int, int],
+    nodes: list[Node],
+    skeleton: "Skeleton",
+    pose_quat: dict[str, tuple[float, float, float, float]] | None = None,
+    posed_world: dict[str, list[list[float]]] | None = None,
+) -> list[list[float]] | None:
+    """Model matrix for an eye or face mesh, or ``None`` if it is not rigid.
+
+    Eye meshes (stride 44) are authored in node-local space and take the node's
+    world matrix. Face meshes (stride 60) are authored at the character root,
+    so the node translation is folded into the same matrix:
+    ``delta * T(bind translation)`` where ``delta = posed * invert(bind)``.
+    This is the matrix form of :func:`anchor_rigid`.
+    """
+    if mesh.stride not in (44, 60):
+        return None
+    node_index = draw_nodes.get(mesh_index)
+    if node_index is None or node_index >= len(nodes):
+        return None
+    name = nodes[node_index].name
+    posed = (posed_world if posed_world is not None else skeleton.world_all(
+        pose_quat=pose_quat
+    )).get(name)
+    if posed is None:
+        return None
+    if mesh.stride == 44:
+        return posed
+    bind = skeleton.world_all().get(name)
+    if bind is None:
+        return None
+    delta = mat_mul(posed, invert(bind))
+    offset = identity()
+    offset[0][3], offset[1][3], offset[2][3] = matrix_translation(bind)
+    return mat_mul(delta, offset)
 
 
 def place_by_nodes(

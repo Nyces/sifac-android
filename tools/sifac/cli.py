@@ -416,39 +416,11 @@ def _pose_meshes(
     across frames; pass the same bind-pose ``meshes`` every time.
     """
     from .bml import Mesh
-    from .skin import auto_weights, deform, palette_map, weights_from_palette
+    from .skin import build_weights, deform
 
     state = cache.get("skin") if cache is not None else None
     if state is None:
-        biped = [name for name in skeleton.nodes if name.startswith("Bip001_")]
-        hair = [name for name in skeleton.nodes if "_bon_" in name]
-        head = [
-            name for name in skeleton.nodes
-            if name in ("Bip001_Head", "Bip001_Neck", "Honoka_head_set")
-        ]
-        mapping = palette_map(meshes, skeleton, biped + hair + head) if any(
-            mesh.bone_indices for mesh in meshes
-        ) else {}
-        weights_by_mesh: list = []
-        for mesh in meshes:
-            lower = mesh.name.lower()
-            if "hair" in lower:
-                candidates = hair + head
-            elif "face" in lower or "eye" in lower:
-                candidates = head
-            else:
-                candidates = biped
-            if mesh.stride in (44, 60) or not candidates:
-                # Eye and face meshes are rigid (anchored by _attach_rigid_meshes);
-                # stage and prop models have no Biped rig.
-                weights_by_mesh.append(None)
-                continue
-            weights_by_mesh.append(
-                weights_from_palette(mesh, skeleton, mapping, candidates)
-                if mesh.bone_indices and mapping
-                else auto_weights(mesh, skeleton, influences, candidates)
-            )
-        state = (mapping, weights_by_mesh)
+        state = build_weights(meshes, skeleton, influences)
         if cache is not None:
             cache["skin"] = state
     mapping, weights_by_mesh = state
@@ -971,52 +943,31 @@ def cmd_live(args: argparse.Namespace) -> int:
     print(f"frames: {len(frames)}")
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
+    if gpu is not None:
+        try:
+            import numpy as np
+        except ImportError as exc:
+            print(f"error: --gpu needs numpy ({exc})", file=sys.stderr)
+            return 1
+        from .gpu import MAX_BONES, CharacterRig
+        from .skin import build_weights
+
+        for entry in models:
+            _, weights_by_mesh = build_weights(
+                entry["meshes"], entry["skeleton"], args.influences
+            )
+            entry["rig"] = CharacterRig(
+                entry["meshes"], entry["skeleton"], weights_by_mesh
+            )
+            if entry["rig"].overflow:
+                print(
+                    f"  {entry['id']}: {len(entry['rig'].palette)} bones exceeds the "
+                    f"{MAX_BONES}-slot palette, drawing this character unskinned",
+                    file=sys.stderr,
+                )
+
     tiles: list[bytes] = []
     for frame in frames:
-        wire: list[tuple[object, object]] = []
-        for entry in models:
-            model = entry["model"]
-            skeleton = entry["skeleton"]
-            pose = sample_pose(entry["motion"], set(skeleton.nodes), frame)
-            if not pose:
-                continue
-            posed, _, _ = _pose_meshes(
-                model,
-                skeleton,
-                entry["meshes"],
-                None,
-                pose,
-                args.influences,
-                cache=entry["cache"],
-            )
-            posed = _attach_rigid_meshes(
-                posed,
-                model,
-                skeleton,
-                pose,
-                nodes=entry["nodes"],
-                draw_nodes=entry["draw_nodes"],
-            )
-            offset_x, offset_y = entry["spot"]
-            for mesh_index, mesh in enumerate(posed):
-                wire.append(
-                    (
-                        Mesh(
-                            name=f"{entry['id']}/{mesh.name}",
-                            vertex_count=mesh.vertex_count,
-                            index_count=mesh.index_count,
-                            stride=mesh.stride,
-                            positions=[
-                                (p[0] + offset_x, p[1] + offset_y, p[2] + floor_top)
-                                for p in mesh.positions
-                            ],
-                            normals=mesh.normals,
-                            uvs=mesh.uvs,
-                            indices=mesh.indices,
-                        ),
-                        entry["bindings"].get(mesh_index),
-                    )
-                )
         if camera_anim is not None:
             state = camera_anim.state(frame)
             frame_camera = Camera(
@@ -1024,15 +975,104 @@ def cmd_live(args: argparse.Namespace) -> int:
                 target=state.target,
                 fov_degrees=state.fov_degrees,
             )
-            layer = None
-            layer_wire = stage_wire + wire
         else:
             frame_camera = camera
-            layer = stage_layer
-            layer_wire = stage_wire + wire if gpu is not None else wire
         if gpu is not None:
-            pixels = gpu.render(layer_wire, textures, frame_camera)
+            from .gpu import DrawItem
+            from .skin import rigid_matrix
+
+            items = [DrawItem(mesh, material) for mesh, material in stage_wire]
+            for entry in models:
+                pose = sample_pose(
+                    entry["motion"], set(entry["skeleton"].nodes), frame
+                )
+                if not pose:
+                    continue
+                offset_x, offset_y = entry["spot"]
+                spot = np.array(
+                    [
+                        [1.0, 0.0, 0.0, offset_x],
+                        [0.0, 1.0, 0.0, offset_y],
+                        [0.0, 0.0, 1.0, floor_top],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                    dtype=np.float32,
+                )
+                rig = entry["rig"]
+                bones = rig.palette_matrices(pose)
+                posed_world = entry["skeleton"].world_all(pose_quat=pose)
+                for mesh_index, mesh in enumerate(entry["meshes"]):
+                    material = entry["bindings"].get(mesh_index)
+                    skin = rig.skins[mesh_index]
+                    if skin is not None and not rig.overflow:
+                        items.append(
+                            DrawItem(mesh, material, model=spot, bones=bones, skin=skin)
+                        )
+                        continue
+                    rigid = rigid_matrix(
+                        mesh_index,
+                        mesh,
+                        entry["draw_nodes"],
+                        entry["nodes"],
+                        entry["skeleton"],
+                        posed_world=posed_world,
+                    )
+                    model = spot if rigid is None else spot @ np.asarray(
+                        rigid, dtype=np.float32
+                    )
+                    items.append(DrawItem(mesh, material, model=model))
+            pixels = gpu.render_items(items, textures, frame_camera)
         else:
+            wire: list[tuple[object, object]] = []
+            for entry in models:
+                model = entry["model"]
+                skeleton = entry["skeleton"]
+                pose = sample_pose(entry["motion"], set(skeleton.nodes), frame)
+                if not pose:
+                    continue
+                posed, _, _ = _pose_meshes(
+                    model,
+                    skeleton,
+                    entry["meshes"],
+                    None,
+                    pose,
+                    args.influences,
+                    cache=entry["cache"],
+                )
+                posed = _attach_rigid_meshes(
+                    posed,
+                    model,
+                    skeleton,
+                    pose,
+                    nodes=entry["nodes"],
+                    draw_nodes=entry["draw_nodes"],
+                )
+                offset_x, offset_y = entry["spot"]
+                for mesh_index, mesh in enumerate(posed):
+                    wire.append(
+                        (
+                            Mesh(
+                                name=f"{entry['id']}/{mesh.name}",
+                                vertex_count=mesh.vertex_count,
+                                index_count=mesh.index_count,
+                                stride=mesh.stride,
+                                positions=[
+                                    (p[0] + offset_x, p[1] + offset_y, p[2] + floor_top)
+                                    for p in mesh.positions
+                                ],
+                                normals=mesh.normals,
+                                uvs=mesh.uvs,
+                                indices=mesh.indices,
+                            ),
+                            entry["bindings"].get(mesh_index),
+                        )
+                    )
+            if camera_anim is not None:
+                layer = None
+                layer_wire = stage_wire + wire
+            else:
+                layer = stage_layer
+                layer_wire = wire
             pixels, _depth = render_buffer(
                 layer_wire,
                 textures,

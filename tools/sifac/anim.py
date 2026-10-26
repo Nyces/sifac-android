@@ -23,6 +23,7 @@ per-key blocks (typically 12-byte float triples for translation and rotation).
 
 from __future__ import annotations
 
+import bisect
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,15 +71,15 @@ class RotationKeys:
             return self.quaternions[0]
         if frame >= self.times[-1]:
             return self.quaternions[-1]
-        for index in range(1, len(self.times)):
-            if frame <= self.times[index]:
-                t0, t1 = self.times[index - 1], self.times[index]
-                q0, q1 = self.quaternions[index - 1], self.quaternions[index]
-                if abs(t1 - t0) < 1e-6:
-                    return q1
-                alpha = (frame - t0) / (t1 - t0)
-                return tuple(a + (b - a) * alpha for a, b in zip(q0, q1))  # type: ignore[return-value]
-        return self.quaternions[-1]
+        index = bisect.bisect_left(self.times, frame)
+        if index <= 0:
+            return self.quaternions[0]
+        t0, t1 = self.times[index - 1], self.times[index]
+        q0, q1 = self.quaternions[index - 1], self.quaternions[index]
+        if abs(t1 - t0) < 1e-6:
+            return q1
+        alpha = (frame - t0) / (t1 - t0)
+        return tuple(a + (b - a) * alpha for a, b in zip(q0, q1))  # type: ignore[return-value]
 
 
 class BmaAnimation:
@@ -93,6 +94,7 @@ class BmaAnimation:
         self.version = ""
         self.duration = 0.0
         self.tracks: list[Track] = []
+        self._rotations: dict[int, RotationKeys | None] = {}
         self._read_header()
         self._read_tracks()
 
@@ -160,7 +162,20 @@ class BmaAnimation:
         return size, self.data[pointer : pointer + size]
 
     def rotation_keys(self, track: Track) -> RotationKeys | None:
-        """Decode a track's rotation channel (time table + quaternions)."""
+        """Decode a track's rotation channel (time table + quaternions).
+
+        Decoding walks every key of the track, so the result is memoised: a
+        nine-performer frame used to re-decode the same 9000-key clip nine
+        times per frame.
+        """
+        cached = self._rotations.get(track.data_offset, ...)
+        if cached is not ...:
+            return cached  # type: ignore[return-value]
+        keys = self._decode_rotation(track)
+        self._rotations[track.data_offset] = keys
+        return keys
+
+    def _decode_rotation(self, track: Track) -> RotationKeys | None:
         times: list[float] | None = None
         quaternions: list[tuple[float, float, float, float]] | None = None
         for index in range(track.key_count):
