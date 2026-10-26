@@ -1334,6 +1334,25 @@ def cmd_survey(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_facial(args: argparse.Namespace) -> int:
+    """Dump the facial preset table behind the timeline cue idents."""
+    from .facial import load_anims, load_presets, preset_name
+
+    presets = load_presets(args.common)
+    anims = load_anims(args.common)
+    print(f"{len(presets)} facial preset(s), {len(anims)} facial anim(s)")
+    for preset_id in sorted(presets):
+        preset = presets[preset_id]
+        print(f"  [{preset_id:3d}] {len(preset.layers)} layer(s): {preset_name(preset)}")
+    if args.anims:
+        print("\nfacial anims (id, a, b, c):")
+        for anim in anims:
+            print(
+                f"  [{anim.anim_id:4d}] {anim.count:2d} {anim.kind:2d} {anim.length:3d}"
+            )
+    return 0
+
+
 def cmd_hexdump(args: argparse.Namespace) -> int:
     data = Path(args.file).read_bytes()
     for line in hexdump(data, offset=args.offset, length=args.length):
@@ -1566,6 +1585,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     survey.add_argument("root", help="game root, the folder that holds live/")
     survey.set_defaults(func=cmd_survey)
+
+    facial = sub.add_parser(
+        "facial", help="dump the facial presets that timeline cue idents select"
+    )
+    facial.add_argument("common", help="path to <dump>/common/common.pac")
+    facial.add_argument("--anims", action="store_true", help="also list the facial anims")
+    facial.set_defaults(func=cmd_facial)
 
     dump = sub.add_parser("hexdump", help="hexdump a file")
     dump.add_argument("file")

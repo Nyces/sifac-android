@@ -43,10 +43,15 @@ The character timeline holds one 0x40-byte record per performer, followed by
 
 The cue intervals are disjoint and shared across the nine performers, so they
 are timeline *segments* rather than per-performer timing; the ``ident`` differs
-per performer inside a segment. The ident comes from a shared namespace: songs
-0010 and 0020 both use 64/65/72/73/74/78/81/82 and add their own values. Its
-meaning is still open, and it cannot select a dance take because each live
-character pack holds exactly one 6.5 MB motion clip.
+per performer inside a segment.
+
+The ``ident`` is a **facial preset id**: ``common/character_common.pac`` holds
+``facial_preset_datas.bin`` whose ``s_facial_preset_datas`` is 62 records of 72
+bytes keyed by exactly this id namespace (see :mod:`sifac.facial`). All 34
+idents used across the dump exist in that table, and two songs quoting the same
+ident therefore play the same face. A cue reads "hold facial preset N from tick
+t for len ticks". It still cannot select a dance take: each live character pack
+holds exactly one 6.5 MB motion clip.
 
 Placement is only verified for song 0010, where one axis stays near 1.4 m for
 all nine performers (chest/head height, or a depth offset) while the other two
