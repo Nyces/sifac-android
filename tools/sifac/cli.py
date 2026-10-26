@@ -635,6 +635,12 @@ def cmd_render(args: argparse.Namespace) -> int:
     posed, mapping, skipped = _pose_meshes(
         archive, skeleton, meshes, None, pose_quat, args.influences
     )
+    if args.expression:
+        from .expression import load_face_expressions
+
+        posed = _apply_expression(
+            posed, args.expression, load_face_expressions(args.pac)
+        )
     placed = _attach_rigid_meshes(posed, archive, skeleton, pose_quat)
 
     textures = load_texture_archive(args.pac)
@@ -652,6 +658,32 @@ def cmd_render(args: argparse.Namespace) -> int:
         f"{skipped} rigid mesh(es) anchored, palette={len(mapping)} -> {target}"
     )
     return 0
+
+
+def _apply_expression(meshes: list, suffix: str, expressions: dict) -> list:
+    """Replace the face mesh with its morphed version (``--expression``)."""
+    from .expression import ExpressionError, expression_suffix, find_expression
+
+    expression = find_expression(expressions, suffix)
+    if expression is None:
+        available = sorted(expression_suffix(name) for name in expressions)
+        raise SystemExit(
+            f"unknown expression {suffix!r}; available: {', '.join(available)}"
+        )
+    applied = 0
+    result = []
+    for mesh in meshes:
+        if "face" not in mesh.name.lower():
+            result.append(mesh)
+            continue
+        try:
+            result.append(expression.apply(mesh))
+            applied += 1
+        except ExpressionError as exc:
+            print(f"warning: {exc}", file=sys.stderr)
+            result.append(mesh)
+    print(f"expression {suffix}: morphed {applied} face mesh(es)")
+    return result
 
 
 def cmd_stage(args: argparse.Namespace) -> int:
@@ -865,6 +897,8 @@ def cmd_live(args: argparse.Namespace) -> int:
     print(f"song {song}: {len(packs)} character pack(s)")
 
     models = []
+    morphed: list[str] = []
+    missing_expression: list[str] = []
     for index, pack in enumerate(packs):
         character_id = pack.name[:3]
         char_pac = root / "chr" / character_id / f"{character_id}.pac"
@@ -874,7 +908,23 @@ def cmd_live(args: argparse.Namespace) -> int:
         model = find_bml_in_pac(char_pac)
         nodes = model.nodes()
         skeleton = Skeleton(nodes)
-        textures.update(load_texture_archive(char_pac))
+        char_textures = load_texture_archive(char_pac)
+        textures.update(char_textures)
+        meshes = model.meshes()
+        if args.expression:
+            from .expression import find_expression, expressions_from_textures
+
+            expression = find_expression(
+                expressions_from_textures(char_textures), args.expression
+            )
+            if expression is None:
+                missing_expression.append(character_id)
+            else:
+                meshes = [
+                    expression.apply(mesh) if "face" in mesh.name.lower() else mesh
+                    for mesh in meshes
+                ]
+                morphed.append(character_id)
         models.append(
             {
                 "id": character_id,
@@ -884,7 +934,7 @@ def cmd_live(args: argparse.Namespace) -> int:
                 "draw_nodes": {
                     call.mesh_index: call.node_index for call in model.draw_calls()
                 },
-                "meshes": model.meshes(),
+                "meshes": meshes,
                 "motion": load_live_motion(pack),
                 "bindings": model.mesh_materials(),
                 "spot": spots[index],
@@ -895,6 +945,12 @@ def cmd_live(args: argparse.Namespace) -> int:
     eye = tuple(args.eye) if args.eye else (0.0, -9.0, floor_top + 1.6)
     target = tuple(args.target) if args.target else (0.0, 1.6, floor_top + 0.6)
     camera = Camera(position=eye, target=target, fov_degrees=args.fov)
+
+    if args.expression:
+        print(
+            f"expression {args.expression}: morphed {len(morphed)} performer(s)"
+            + (f", missing on {len(missing_expression)}" if missing_expression else "")
+        )
 
     camera_anim = None
     if args.camera_anim:
@@ -1422,6 +1478,12 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--clip", default=None)
     render.add_argument("--frame", type=float, default=0.0)
     render.add_argument("--influences", type=int, default=2)
+    render.add_argument(
+        "--expression",
+        default=None,
+        metavar="SUFFIX",
+        help="face morph target, e.g. eye_Blink or mouth_Smile (see the warnings for the list)",
+    )
     render.add_argument("--width", type=int, default=512)
     render.add_argument("--height", type=int, default=768)
     render.add_argument("--out", required=True)
@@ -1482,6 +1544,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--gpu",
         action="store_true",
         help="rasterise through moderngl/OpenGL instead of the Python software renderer",
+    )
+    live.add_argument(
+        "--expression",
+        default=None,
+        metavar="SUFFIX",
+        help="face morph target applied to every performer, e.g. eye_Blink",
     )
     live.add_argument("--sheet", default=None, metavar="PNG")
     live.add_argument("--columns", type=int, default=0)

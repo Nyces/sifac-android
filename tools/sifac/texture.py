@@ -29,12 +29,10 @@ F16F16, F32, RGBA_U32U32, A16B16G16R16 (0x1b), ...``. A RenderDoc capture of
 the retail game confirms 0x1b is uploaded as ``VK_FORMAT_R16G16B16A16_SFLOAT``
 (128x64 face-expression texture, 64 KiB, no mips).
 
-Format ``0x1b`` is not a picture despite the name: every face-expression
-texture of one character is 128x64, channel 3 is binary (0x0000 / 0x3c00, i.e.
-0.0 / 1.0 as half floats) and identical across expressions, and channels 0..2
-are zero except in a few bands. The model's face material still samples
-``honoka_body_01``, so the expression textures feed a face shader whose use we
-have not decoded; ``to_rgba`` just clamps the halves to 0..1.
+Format ``0x1b`` is not a picture: it is a per-vertex morph target for the face
+mesh. ``sifac.expression`` decodes it (positions in texels ``[0, 4096)``,
+normals after that, channel 3 as a validity mask), so ``to_rgba`` here only
+exists for inspection and clamps the half floats to 0..255.
 """
 
 from __future__ import annotations
@@ -237,55 +235,94 @@ def find_textures(data: bytes, limit: int = 0x400) -> list[int]:
     return offsets
 
 
+def scan_loose_textures(data: bytes) -> dict[str, "BtxTexture"]:
+    """Every btx blob stored directly in a buffer, outside any ARC.
+
+    Character packs keep the 45-47 face-expression maps as loose 64 KiB blobs
+    (0x80 header + 128x64 RGBA16F) between the ARC payloads, so the texture
+    ARCHive inside ``model.pac`` only holds the eight BC7 maps. Walking the raw
+    buffer is the only way to reach them.
+    """
+    textures: dict[str, BtxTexture] = {}
+    position = 0
+    while True:
+        position = data.find(BTX_MAGIC, position)
+        if position < 0:
+            break
+        try:
+            header = parse_header(data, position)
+            size = HEADER_SIZE + level_size(header.width, header.height, header.format)
+        except (BtxError, struct.error):
+            position += 1
+            continue
+        if position + size > len(data):
+            position += 1
+            continue
+        texture = BtxTexture(data[position : position + size])
+        name = texture.header.name
+        if name and name not in textures:
+            textures[name] = texture
+        # Jump past this blob: its payload can contain the magic by accident.
+        position += size
+    return textures
+
+
 def load_texture_archive(pac_path: str | Path) -> dict[str, "BtxTexture"]:
     """Load every btx texture a model uses, keyed by both btx and ARC name.
 
-    Two layouts exist:
+    Three layouts exist:
 
     * characters — ``model.pac`` holds the BMAR and a ``texture`` ARC;
     * stages — ``model.pac`` holds only the BMAR and the textures live in a
-      sibling top-level ``texture.pac``.
+      sibling top-level ``texture.pac``;
+    * face expressions — loose blobs inside the character ``.pac`` itself,
+      outside every ARC.
+
+    The loose scan always runs, so callers see one flat name map.
     """
     from .arc import ArcArchive, ArcError
     from .binary import unwrap_section
     from .pac import read_pac
 
     image = read_pac(pac_path)
-    top = ArcArchive(image.data)
-    texture_bytes: bytes | None = None
+    textures: dict[str, BtxTexture] = {}
+    for name, texture in scan_loose_textures(image.data).items():
+        textures[name] = texture
 
+    def collect(texture_bytes: bytes) -> dict[str, BtxTexture]:
+        try:
+            texture_arc = ArcArchive(texture_bytes)
+        except ArcError:
+            return {}
+        found: dict[str, BtxTexture] = {}
+        for entry in texture_arc.entries:
+            payload, _ = unwrap_section(texture_arc.entry_data(entry))
+            try:
+                texture = BtxTexture(payload)
+            except BtxError:
+                continue
+            name = texture.header.name or entry.name
+            found[name] = texture
+            found.setdefault(entry.name, texture)
+        return found
+
+    top = ArcArchive(image.data)
     sibling = top.find("texture.pac") or next(
         (entry for entry in top.entries if entry.type == "texs"), None
     )
     if sibling is not None:
-        texture_bytes = unwrap_section(top.entry_data(sibling))[0]
+        textures.update(collect(unwrap_section(top.entry_data(sibling))[0]))
+        return textures
 
-    if texture_bytes is None:
-        model_entry = top.find("model.pac")
-        if model_entry is None:
-            return {}
-        model_bytes, _ = unwrap_section(top.entry_data(model_entry))
-        model_arc = ArcArchive(model_bytes)
-        nested = model_arc.find("texture") or next(
-            (entry for entry in model_arc.entries if entry.type == "texs"), None
-        )
-        if nested is None:
-            return {}
-        texture_bytes = unwrap_section(model_arc.entry_data(nested))[0]
-
-    try:
-        texture_arc = ArcArchive(texture_bytes)
-    except ArcError:
-        return {}
-    textures: dict[str, BtxTexture] = {}
-    for entry in texture_arc.entries:
-        payload, _ = unwrap_section(texture_arc.entry_data(entry))
-        try:
-            texture = BtxTexture(payload)
-        except BtxError:
-            continue
-        name = texture.header.name or entry.name
-        textures[name] = texture
-        textures.setdefault(entry.name, texture)
+    model_entry = top.find("model.pac")
+    if model_entry is None:
+        return textures
+    model_bytes, _ = unwrap_section(top.entry_data(model_entry))
+    model_arc = ArcArchive(model_bytes)
+    nested = model_arc.find("texture") or next(
+        (entry for entry in model_arc.entries if entry.type == "texs"), None
+    )
+    if nested is not None:
+        textures.update(collect(unwrap_section(model_arc.entry_data(nested))[0]))
     return textures
 

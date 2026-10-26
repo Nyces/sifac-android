@@ -13,6 +13,7 @@ from sifac.render import (
     _repair_uvs,
     _uv_scale,
     encode_sheet,
+    frame_stats,
     render_buffer,
     render_textured,
 )
@@ -74,6 +75,27 @@ class RenderTests(unittest.TestCase):
         mesh = make_quad()
         png = render_textured([mesh], {}, {}, width=32, height=32)
         self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_ortho_preview_fills_pixels(self) -> None:
+        """The orthographic preview must emit clip space, not pixel space.
+
+        A regression here renders a uniformly background-coloured image, which
+        a header-only assertion would not catch. The 128 px canvas leaves the
+        default 16 px margin at only 12% of each side.
+        """
+        pixels, _depth = render_buffer([(make_quad(), None)], {}, width=128, height=128)
+        background = bytes(BACKGROUND[:3])
+        filled = sum(
+            1 for index in range(0, len(pixels), 4) if pixels[index : index + 3] != background
+        )
+        self.assertGreater(filled, 128 * 128 // 3)
+
+    def test_frame_stats_reports_coverage(self) -> None:
+        pixels, _depth = render_buffer([(make_quad(), None)], {}, width=128, height=128)
+        share, mean = frame_stats(pixels, 128, 128)
+        self.assertGreater(share, 0.3)
+        self.assertGreater(mean, 0.0)
+        self.assertEqual(frame_stats(bytes(BACKGROUND) * (128 * 128), 128, 128)[0], 0.0)
 
     def test_layer_reuse_keeps_base_pixels(self) -> None:
         mesh = make_quad()

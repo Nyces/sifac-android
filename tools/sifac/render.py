@@ -562,10 +562,15 @@ def render_buffer(
                 uv_scale = _uv_scale(mesh, uvs, tex_width, tex_height)
 
         if camera is None:
+            # The rasteriser works in clip space and divides by w, so the ortho
+            # preview must emit NDC rather than pixels.
             source = [
                 (
-                    (p[0] - min_x) * scale + ortho_margin,
-                    height - 1 - ((p[2] - min_z) * scale + ortho_margin),
+                    (((p[0] - min_x) * scale + ortho_margin) / width) * 2.0 - 1.0,
+                    1.0 - (
+                        (height - 1 - ((p[2] - min_z) * scale + ortho_margin))
+                        / height
+                    ) * 2.0,
                     p[1],
                     1.0,
                 )
